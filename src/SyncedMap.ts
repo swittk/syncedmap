@@ -62,7 +62,8 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private redisSubscribed = false;
   private readyFlag = false;
   private disposed = false;
-  private bufferedEvents: ReplicationEvent<Key>[] = [];
+  /** Latest event per key during hydration; bounds memory by changed key count. */
+  private bufferedEvents = new Map<Key, ReplicationEvent<Key>>();
   private buffering = false;
   private resyncJob?: Promise<void>;
   private resyncAgain = false;
@@ -313,14 +314,17 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
 
   private receiveEvent(event: ReplicationEvent<Key>): void {
     if (this.buffering) {
-      // Keep the live local Map current even while a snapshot is loading.
-      // Replay the same event after swapping in the scanned snapshot.
-      this.bufferedEvents.push(event);
+      // Live observers receive each change now; snapshot replay will be silent.
+      // Only the highest revision per key is needed to repair a stale scan.
+      const previous = this.bufferedEvents.get(event.key);
+      if (!previous || event.revision > previous.revision) {
+        this.bufferedEvents.set(event.key, event);
+      }
     }
     this.applyEvent(event);
   }
 
-  private applyEvent(event: ReplicationEvent<Key>): void {
+  private applyEvent(event: ReplicationEvent<Key>, notify = true): void {
     if (event.revision <= this.baselineRevision ||
         event.revision <= (this.versionsByKey.get(event.key) ?? 0)) return;
     if (event.record !== null) {
@@ -329,15 +333,20 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       entry.value = freezeValue(entry.value);
       this.entriesByKey.set(event.key, entry);
       this.versionsByKey.set(event.key, event.revision);
-      this.emit({
-        type: 'set', key: event.key, value: entry.value, revision: event.revision,
-        origin: event.origin === this.instanceId ? 'local' : 'remote',
-      });
+      if (notify) {
+        this.emit({
+          type: 'set', key: event.key, value: entry.value, revision: event.revision,
+          origin: event.origin === this.instanceId ? 'local' : 'remote',
+        });
+      }
     } else {
       const existed = this.entriesByKey.has(event.key);
       this.entriesByKey.delete(event.key);
-      this.versionsByKey.set(event.key, event.revision);
-      if (existed) {
+      // Local mode has no delayed remote events: retaining tombstones would
+      // leak one Map entry per deleted key indefinitely.
+      if (this.redis) this.versionsByKey.set(event.key, event.revision);
+      else this.versionsByKey.delete(event.key);
+      if (existed && notify) {
         this.emit({
           type: 'delete', key: event.key, revision: event.revision,
           origin: event.origin === this.instanceId ? 'local' : 'remote',
@@ -352,7 +361,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     const subscriber = this.subscriber;
     if (!redis || !subscriber || this.disposed) return;
     this.buffering = true;
-    this.bufferedEvents = [];
+    this.bufferedEvents = new Map();
     try {
       await subscriber.subscribe(this.eventChannel);
       const baselineRaw = await redis.get(this.revisionKey);
@@ -387,15 +396,17 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       this.entriesByKey = values;
       this.versionsByKey = versions;
       this.baselineRevision = baseline;
-      this.bufferedEvents = [];
+      this.bufferedEvents = new Map();
       this.buffering = false;
-      for (const event of pending) this.applyEvent(event);
+      // These mutations were already delivered to live subscribers. Replay
+      // only the newest state per key, then emit one resync notification.
+      for (const event of pending.values()) this.applyEvent(event, false);
       this.emit({ type: 'resync' });
     } catch (error) {
-      const buffered = this.bufferedEvents;
-      this.bufferedEvents = [];
+      // Failed hydration never swaps the snapshot: live events have already
+      // been applied and notified, so replaying would only duplicate them.
+      this.bufferedEvents = new Map();
       this.buffering = false;
-      for (const event of buffered) this.applyEvent(event);
       throw error;
     }
   }

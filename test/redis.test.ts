@@ -317,6 +317,121 @@ describe('real Redis replication', () => {
     }
   }, 10000);
 
+  it('compacts buffered events and avoids duplicate notifications during a stale snapshot', async () => {
+    const namespace = 'buffered-replay';
+    const writer = openMap(namespace);
+    await writer.ready();
+    await writer.set('anchor', 0);
+
+    const client = new Redis(url);
+    const replica = new SyncedMap<string, number>({
+      namespace, redis: { client },
+      onError: error => { backgroundErrors.push(error); },
+    });
+    maps.push(replica);
+    await replica.ready();
+    const observed: Array<{ type: string; key?: string; value?: number }> = [];
+    replica.subscribe(change => {
+      if (change.type === 'set') observed.push({ type: 'set', key: change.key, value: change.value });
+      else observed.push({ type: change.type });
+    });
+
+    const originalMget = client.mget.bind(client);
+    let releaseSnapshot: () => void = () => undefined;
+    const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+    let markSnapshotPaused: () => void = () => undefined;
+    const snapshotPaused = new Promise<void>(resolve => { markSnapshotPaused = resolve; });
+    let holdOnce = true;
+    client.mget = (async (...keys: string[]) => {
+      const snapshot = await originalMget(...keys);
+      if (holdOnce) {
+        holdOnce = false;
+        markSnapshotPaused();
+        await snapshotGate;
+      }
+      return snapshot;
+    }) as typeof client.mget;
+
+    try {
+      const running = replica.resync();
+      await snapshotPaused;
+
+      for (let i = 1; i <= 35; i++) await writer.set('anchor', i);
+      await writer.set('late', 1001);
+      await eventually(() => replica.get('anchor') === 35 && replica.get('late') === 1001);
+      expect((replica as unknown as {
+        bufferedEvents: Map<string, unknown>;
+      }).bufferedEvents.size).toBe(2);
+
+      const priorSetNotifications = observed.filter(change => change.type === 'set');
+      expect(priorSetNotifications).toHaveLength(36);
+      releaseSnapshot();
+      await running;
+      expect(replica.get('anchor')).toBe(35);
+      expect(replica.get('late')).toBe(1001);
+      expect(observed.filter(change => change.type === 'set')).toEqual(priorSetNotifications);
+      expect(observed.filter(change => change.type === 'resync')).toHaveLength(1);
+      expect((replica as unknown as {
+        bufferedEvents: Map<string, unknown>;
+      }).bufferedEvents.size).toBe(0);
+    } finally {
+      releaseSnapshot();
+      client.mget = originalMget as typeof client.mget;
+      await replica.dispose();
+      client.disconnect();
+    }
+  }, 20000);
+
+  it('keeps already-notified live state after a failed hydration', async () => {
+    const namespace = 'buffered-replay-error';
+    const writer = openMap(namespace);
+    await writer.ready();
+    await writer.set('key', 0);
+
+    const client = new Redis(url);
+    const replica = new SyncedMap<string, number>({ namespace, redis: { client } });
+    maps.push(replica);
+    await replica.ready();
+    const seen: number[] = [];
+    replica.subscribe(change => {
+      if (change.type === 'set') seen.push(change.value);
+    });
+
+    const originalMget = client.mget.bind(client);
+    let releaseSnapshot: () => void = () => undefined;
+    const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+    let markSnapshotPaused: () => void = () => undefined;
+    const snapshotPaused = new Promise<void>(resolve => { markSnapshotPaused = resolve; });
+    let failOnce = true;
+    client.mget = (async (...keys: string[]) => {
+      if (!failOnce) return originalMget(...keys);
+      failOnce = false;
+      markSnapshotPaused();
+      await snapshotGate;
+      throw new Error('Injected hydration failure');
+    }) as typeof client.mget;
+
+    try {
+      const running = replica.resync();
+      await snapshotPaused;
+      await writer.set('key', 1);
+      await writer.set('key', 2);
+      await eventually(() => replica.get('key') === 2);
+      releaseSnapshot();
+      await expect(running).rejects.toThrow('Injected hydration failure');
+      expect(replica.get('key')).toBe(2);
+      expect(seen).toEqual([1, 2]);
+      expect((replica as unknown as {
+        bufferedEvents: Map<string, unknown>;
+      }).bufferedEvents.size).toBe(0);
+    } finally {
+      releaseSnapshot();
+      client.mget = originalMget as typeof client.mget;
+      await replica.dispose();
+      client.disconnect();
+    }
+  }, 12000);
+
   it('synchronizes real separate Node processes, not just instances in one process', async () => {
     const namespace = 'processes';
     const main = openMap(namespace);

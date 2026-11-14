@@ -105,6 +105,27 @@ describe('SyncedMap local mode', () => {
     expect(map.get('key')).toBe(2);
   });
 
+  it('does not retain tombstones for deleted local-only keys', async () => {
+    const map = createMap<number>();
+    for (let i = 0; i < 250; i++) {
+      const key = 'short-lived-' + i;
+      await map.set(key, i);
+      expect(await map.delete(key)).toBe(true);
+    }
+    expect(map.size).toBe(0);
+    // Inspect the internal revision index: no deleted-key history should be
+    // retained indefinitely by local-only maps.
+    const revisions = (map as unknown as { versionsByKey: Map<string, number> }).versionsByKey;
+    expect(revisions.size).toBe(0);
+    await map.set('reused', 1);
+    await map.delete('reused');
+    await map.set('reused', 2);
+    expect(map.get('reused')).toBe(2);
+    expect(revisions.size).toBe(1);
+    await map.clear();
+    expect(revisions.size).toBe(0);
+  });
+
   it('publishes writes and protects against returning live input objects', async () => {
     const map = createMap<{ score: number }>();
     const observed: string[] = [];
