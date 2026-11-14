@@ -577,6 +577,36 @@ describe('real Redis replication', () => {
     }
   });
 
+  it('keeps a near-MAX_SAFE_INTEGER Redis expiry in exact decimal form', async () => {
+    const map = openMap('safe-expiry-boundary');
+    await map.ready();
+    const client = new Redis(url);
+    try {
+      // Use the authoritative Redis clock, not the Node clock, to place the
+      // expiry near the largest safe integer without exceeding it.
+      const [seconds, micros] = await client.time();
+      const redisNow = Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
+      const ttlMs = Number.MAX_SAFE_INTEGER - redisNow - 2000;
+      expect(Number.isSafeInteger(ttlMs)).toBe(true);
+      await map.set('boundary', 7, { ttlMs });
+      const stored = await client.get('syncedmap:{safe-expiry-boundary}:entry:boundary');
+      expect(stored).not.toBeNull();
+      const expiryText = stored!.split('|')[1]!;
+      expect(expiryText).toMatch(/^\d+$/);
+      expect(Number.isSafeInteger(Number(expiryText))).toBe(true);
+      expect(await map.getFresh('boundary')).toBe(7);
+      expect(await map.readLocked('boundary', value => value)).toBe(7);
+      await map.update('boundary', value => (value ?? 0) + 1, { ttlMs });
+      expect(await map.getFresh('boundary')).toBe(8);
+      const second = openMap('safe-expiry-boundary');
+      await second.ready();
+      expect(second.get('boundary')).toBe(8);
+    } finally {
+      await client.del('syncedmap:{safe-expiry-boundary}:entry:boundary');
+      client.disconnect();
+    }
+  }, 12000);
+
   it('rejects an evictable Redis revision counter at startup but accepts volatile eviction', async () => {
     const client = new Redis(url);
     try {
