@@ -137,10 +137,18 @@ millions of keys.
 
 ## Redis configuration
 
-The per-namespace revision counter has no TTL. Redis eviction must not discard
-it: when maxmemory is enabled, use the noeviction or a volatile-* policy, not
-allkeys-*. SyncedMap checks Redis INFO memory during initialization and rejects
-unsafe policies. This policy must remain unchanged while the map is running.
+The per-namespace revision counter has no TTL, so a volatile-* eviction policy
+cannot evict it. However, entries **with TTLs can be evicted early** under
+volatile-* when Redis reaches maxmemory. Those evictions do not produce
+SyncedMap notifications: another replica's synchronous get() may return the
+evicted value until reconciliation or its recorded expiration. getFresh() and
+readLocked() use authoritative Redis state and do not return the evicted entry.
+
+Use noeviction when premature entry loss is unacceptable; note that Redis then
+rejects writes when it runs out of memory. Use volatile-* only when such entry
+loss is acceptable, and never use allkeys-* because it can evict the revision
+counter. SyncedMap checks Redis INFO memory at initialization. Keep the eviction
+policy unchanged while the map is running.
 
 ## Redis failures
 
