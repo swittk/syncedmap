@@ -117,7 +117,11 @@ millions of keys.
 - ttlMs can be provided as a default or per write. Per-write ttlMs: 0 turns
   off a default expiry for that entry.
 - Redis handles physical key expiry, while local reads check absolute expiry
-  without waiting for a Pub/Sub notification.
+  without waiting for a Pub/Sub notification. Fresh Redis reads use Redis's
+  expiry decision, not the Node.js clock, which may be skewed.
+- Local-only mode uses one timer and an indexed expiration queue to discard
+  expired entries even when there are no subsequent reads. Expiry bookkeeping
+  is O(log n) per changed expiring key and does not retain stale tombstones.
 - Time-based expiry cannot be frozen by a mutex. Expiry itself does not publish
   a SyncedMap delete notification.
 - clear() deletes keys individually and is not globally atomic; new writes

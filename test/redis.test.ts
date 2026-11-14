@@ -3,7 +3,7 @@ import { createServer } from 'node:net';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import Redis from 'ioredis';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SyncedMap } from '../src/index.js';
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -429,6 +429,28 @@ describe('real Redis replication', () => {
       client.mget = originalMget as typeof client.mget;
       await replica.dispose();
       client.disconnect();
+    }
+  }, 12000);
+
+  it('does not treat Redis-authoritative TTL values as expired due to client clock skew', async () => {
+    const map = openMap('redis-clock-skew');
+    await map.ready();
+    await map.set('still-live', 3, { ttlMs: 7000 });
+    const accurateNow = Date.now.bind(Date);
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => accurateNow() + 60_000);
+    try {
+      expect(await map.getFresh('still-live')).toBe(3);
+      expect(await map.readLocked('still-live', async value => value)).toBe(3);
+      let received: number | undefined;
+      const updated = await map.update('still-live', value => {
+        received = value;
+        return (value ?? 0) + 1;
+      }, { ttlMs: 7000 });
+      expect(received).toBe(3);
+      expect(updated).toBe(4);
+      expect(await map.getFresh('still-live')).toBe(4);
+    } finally {
+      clock.mockRestore();
     }
   }, 12000);
 

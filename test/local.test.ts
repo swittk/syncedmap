@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { SyncedMapConflictError } from '../src/index.js';
 import { SyncedMap } from '../src/index.js';
 
 const opened: Array<SyncedMap<string, unknown>> = [];
@@ -124,6 +125,58 @@ describe('SyncedMap local mode', () => {
     expect(revisions.size).toBe(1);
     await map.clear();
     expect(revisions.size).toBe(0);
+  });
+
+  it('reclaims local TTL entries even when nobody reads them, and cancels replaced expiries', async () => {
+    const map = createMap<number>();
+    for (let i = 0; i < 120; i++) {
+      await map.set('expiring-' + i, i, { ttlMs: 45 });
+    }
+    await map.set('persist', 123, { ttlMs: 20 });
+    await map.set('persist', 456, { ttlMs: 0 });
+    await map.set('deleted', 9, { ttlMs: 40 });
+    await map.delete('deleted');
+
+    // Deliberately perform no get(), size, or iteration while TTLs elapse.
+    await new Promise(resolve => setTimeout(resolve, 105));
+    const internal = map as unknown as {
+      entriesByKey: Map<string, unknown>;
+      versionsByKey: Map<string, number>;
+      localExpiryQueue: { nodes: unknown[]; positions: Map<string, number> };
+    };
+    expect(internal.entriesByKey.size).toBe(1);
+    expect(internal.versionsByKey.size).toBe(1);
+    expect(internal.localExpiryQueue.nodes).toHaveLength(0);
+    expect(internal.localExpiryQueue.positions.size).toBe(0);
+    expect(map.get('persist')).toBe(456);
+    await map.delete('persist');
+    expect(internal.entriesByKey.size).toBe(0);
+  });
+
+  it('enforces revision CAS for sibling reentrant updates under one local lock', async () => {
+    const map = createMap<number>();
+    await map.set('count', 0);
+    let arrived = 0;
+    let release: () => void = () => undefined;
+    const bothRead = new Promise<void>(resolve => { release = resolve; });
+    const results = await map.withLock('count', () => Promise.allSettled([
+      map.update('count', async current => {
+        if (++arrived === 2) release();
+        await bothRead;
+        return (current ?? 0) + 1;
+      }),
+      map.update('count', async current => {
+        if (++arrived === 2) release();
+        await bothRead;
+        return (current ?? 0) + 1;
+      }),
+    ]));
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const failures = results.filter(result => result.status === 'rejected');
+    expect(failures).toHaveLength(1);
+    expect((failures[0] as PromiseRejectedResult).reason).toBeInstanceOf(SyncedMapConflictError);
+    expect(map.get('count')).toBe(1);
+    expect(await map.update('count', n => (n ?? 0) + 1)).toBe(2);
   });
 
   it('publishes writes and protects against returning live input objects', async () => {

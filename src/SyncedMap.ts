@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import loadOptionalRedis from './redisLoader.cjs';
+import { LocalExpiryQueue } from './localExpiryQueue.js';
 import { UniqueMutexManager } from 'uniquemutexmanager';
 import { READ_SCRIPT, WRITE_SCRIPT, encodeRecord, freezeValue, parseRecord, serializeJson } from './redisProtocol.js';
 import type { StoredRecord } from './redisProtocol.js';
@@ -54,6 +55,8 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private readonly defaultTtlMs: number;
   private readonly errorHandler?: (error: Error) => void;
   private readonly listeners = new Set<(change: SyncedMapChange<Key, Value>) => void>();
+  /** Local mode needs expiry cleanup even when nobody calls get() or iterates. */
+  private readonly localExpiryQueue?: LocalExpiryQueue<Key>;
 
   private mutex: UniqueMutexManager;
   private redis?: SyncedMapRedisClient;
@@ -95,6 +98,14 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.mutex = new UniqueMutexManager({ namespace: this.redisPrefix });
 
     if (!options.redis) {
+      this.localExpiryQueue = new LocalExpiryQueue((key, expiresAt) => {
+        const entry = this.entriesByKey.get(key);
+        // A newer write can replace this key before the expiration callback.
+        if (entry && entry.expiresAt === expiresAt && expiresAt <= Date.now()) {
+          this.entriesByKey.delete(key);
+          this.versionsByKey.delete(key);
+        }
+      });
       this.readyFlag = true;
       this.initialization = Promise.resolve();
     } else {
@@ -254,6 +265,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (value === undefined && entry && !this.redis) {
       this.entriesByKey.delete(key);
       this.versionsByKey.delete(key);
+      this.localExpiryQueue?.delete(key);
     }
     return value;
   }
@@ -333,6 +345,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       entry.value = freezeValue(entry.value);
       this.entriesByKey.set(event.key, entry);
       this.versionsByKey.set(event.key, event.revision);
+      if (!this.redis) this.localExpiryQueue?.set(event.key, entry.expiresAt);
       if (notify) {
         this.emit({
           type: 'set', key: event.key, value: entry.value, revision: event.revision,
@@ -342,6 +355,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     } else {
       const existed = this.entriesByKey.has(event.key);
       this.entriesByKey.delete(event.key);
+      if (!this.redis) this.localExpiryQueue?.delete(event.key);
       // Local mode has no delayed remote events: retaining tombstones would
       // leak one Map entry per deleted key indefinitely.
       if (this.redis) this.versionsByKey.set(event.key, event.revision);
@@ -441,6 +455,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     const redis = this.redis;
     if (!redis) {
       const entry = this.entriesByKey.get(key);
+      // Local expiration is authoritative and handled by our timer / clock.
       return { entry, expectedRevision: entry?.version ?? 0, value: this.currentValue(entry) };
     }
     const result = await redis.eval(READ_SCRIPT, 2, this.entryRedisKey(key), this.revisionKey);
@@ -454,7 +469,9 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       const entry = parseRecord<Value>(raw);
       entry.value = freezeValue(entry.value);
       this.receiveEvent({ key, revision: entry.version, record: raw, origin: 'fresh-read' });
-      return { entry, expectedRevision: entry.version, value: this.currentValue(entry) };
+      // Redis checked expiry while serving GET. Do not second-guess its
+      // result with a different machine's clock, which may be skewed.
+      return { entry, expectedRevision: entry.version, value: entry.value };
     }
     // A missing entry is authoritative as of the global revision. The
     // revision is needed to suppress older, delayed set notifications.
@@ -509,8 +526,13 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   ): Promise<boolean> {
     const redis = this.redis;
     if (!redis) {
-      const existed = this.currentValue(this.entriesByKey.get(key)) !== undefined;
-      if (action === 'delete' && !this.entriesByKey.has(key)) return false;
+      const existing = this.entriesByKey.get(key);
+      const currentRevision = existing?.version ?? 0;
+      // Reentrant sibling updates inside withLock can overlap. The local
+      // branch must preserve the same revision CAS guarantee as Redis.
+      if (currentRevision !== expectedRevision) throw new SyncedMapConflictError(key);
+      const existed = this.currentValue(existing) !== undefined;
+      if (action === 'delete' && !existing) return false;
       const version = ++this.localRevision;
       const record = action === 'set'
         ? encodeRecord({ version, expiresAt: ttlMs > 0 ? Date.now() + ttlMs : 0, value: undefined }, jsonValue)
@@ -585,7 +607,9 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       }
       const json = serializeJson(nextValue);
       await this.commit(key, 'set', previous.expectedRevision, json, ttlMs);
-      return this.get(key);
+      // This write was acknowledged. Its local cache might look expired if
+      // this process's clock is ahead of Redis. Return the committed value.
+      return this.entriesByKey.get(key)?.value ?? freezeValue(JSON.parse(json) as Value);
     });
   }
 
@@ -620,6 +644,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.readyFlag = false;
     this.cancelInitialization();
     if (this.resyncTimer) clearInterval(this.resyncTimer);
+    this.localExpiryQueue?.dispose();
     this.listeners.clear();
     // Unblock connection/subscription attempts that are still initializing.
     this.closeOwnedConnections();
