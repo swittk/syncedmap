@@ -175,6 +175,21 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
     const redis = this.redis;
     if (!redis) throw new Error('Unable to initialize the SyncedMap Redis connection.');
+    redis.on('error', this.onCommandError);
+    if (this.ownsRedis) await this.duringInitialization(redis.connect());
+    if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
+    // Revision counters have no TTL, but Redis allkeys eviction can still
+    // discard them. That would restart revision numbering and silently drop
+    // acknowledged notifications. Verify this once, not on the hot path.
+    const memoryInfo = await this.duringInitialization(redis.info('memory'));
+    const maxmemory = /^maxmemory:(\d+)\s*$/m.exec(memoryInfo)?.[1];
+    const policy = /^maxmemory_policy:([^\r\n]+)\s*$/m.exec(memoryInfo)?.[1];
+    if (maxmemory === undefined || policy === undefined) {
+      throw new Error('SyncedMap requires Redis INFO memory to verify revision counter safety.');
+    }
+    if (Number(maxmemory) > 0 && policy.startsWith('allkeys-')) {
+      throw new Error('SyncedMap requires a noeviction or volatile-* Redis maxmemory-policy when maxmemory is enabled.');
+    }
     // Redis Pub/Sub is shared across SELECTed databases. Scope the channel to
     // the client's configured database, just as Redis scopes stored keys.
     const database = redis.options?.db;
@@ -182,9 +197,6 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       throw new TypeError('SyncedMap requires a Redis client with a valid options.db.');
     }
     this.eventChannel = this.redisPrefix + ':db:' + database + ':events';
-    redis.on('error', this.onCommandError);
-    if (this.ownsRedis) await this.duringInitialization(redis.connect());
-    if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
     // UMM 0.2 reuses the caller-owned command client. One subscriber connection
     // is necessary because Redis puts SUBSCRIBE clients into subscriber mode.
     const previous = this.mutex;
@@ -548,9 +560,13 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       if (currentRevision !== expectedRevision) throw new SyncedMapConflictError(key);
       const existed = this.currentValue(existing) !== undefined;
       if (action === 'delete' && !existing) return false;
+      const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : 0;
+      if (!Number.isSafeInteger(expiresAt)) {
+        throw new RangeError('SyncedMap expiration exceeds the supported timestamp range.');
+      }
       const version = ++this.localRevision;
       const record = action === 'set'
-        ? encodeRecord({ version, expiresAt: ttlMs > 0 ? Date.now() + ttlMs : 0, value: undefined }, jsonValue)
+        ? encodeRecord({ version, expiresAt, value: undefined }, jsonValue)
         : null;
       this.receiveEvent({ key, revision: version, record, origin: this.instanceId });
       return existed;
@@ -563,6 +579,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     const status = Number(output[0]);
     if (status === 0) throw new SyncedMapConflictError(key);
     if (status === 2) return false;
+    if (status === 3) throw new RangeError('SyncedMap expiration exceeds the supported timestamp range.');
     if (status !== 1) throw new Error('Invalid SyncedMap Redis write status.');
     const version = Number(output[1]);
     if (!Number.isSafeInteger(version) || version < 1) throw new Error('Invalid SyncedMap Redis write version.');

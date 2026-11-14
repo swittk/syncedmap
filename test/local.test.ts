@@ -179,6 +179,19 @@ describe('SyncedMap local mode', () => {
     expect(await map.update('count', n => (n ?? 0) + 1)).toBe(2);
   });
 
+  it('rejects unsafe absolute local expiry without corrupting the entry', async () => {
+    const map = createMap<number>();
+    await map.set('existing', 1);
+    await expect(map.set('existing', 2, { ttlMs: Number.MAX_SAFE_INTEGER }))
+      .rejects.toThrow(/expiration exceeds/);
+    expect(map.get('existing')).toBe(1);
+    await expect(map.set('new', 3, { ttlMs: Number.MAX_SAFE_INTEGER }))
+      .rejects.toThrow(/expiration exceeds/);
+    expect(map.get('new')).toBeUndefined();
+    expect(map.size).toBe(1);
+    expect(await map.update('existing', v => (v ?? 0) + 1)).toBe(2);
+  });
+
   it('publishes writes and protects against returning live input objects', async () => {
     const map = createMap<{ score: number }>();
     const observed: string[] = [];

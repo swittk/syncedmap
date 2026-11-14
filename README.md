@@ -115,11 +115,15 @@ millions of keys.
 
 ## Values and TTL
 
-- Keys must be strings; values must be JSON-serializable.
+- Keys must be strings; values must survive a JSON stringify/parse round trip
+  without changing their intended types. A Date, for example, becomes a string;
+  class instances and Map/Set objects do not preserve their prototypes.
+  Use plain JSON data, not objects requiring custom methods.
 - Values are deeply frozen after JSON deserialization; mutate with set/update,
   not by modifying the object returned from get().
 - ttlMs can be provided as a default or per write. Per-write ttlMs: 0 turns
-  off a default expiry for that entry.
+  off a default expiry for that entry. Expiries beyond the safe JSON timestamp
+  range are rejected before committing a write.
 - Redis handles physical key expiry, while local reads check absolute expiry
   without waiting for a Pub/Sub notification. Fresh Redis reads use Redis's
   expiry decision, not the Node.js clock, which may be skewed.
@@ -130,6 +134,13 @@ millions of keys.
   a SyncedMap delete notification.
 - clear() deletes keys individually and is not globally atomic; new writes
   concurrent with clear() may remain.
+
+## Redis configuration
+
+The per-namespace revision counter has no TTL. Redis eviction must not discard
+it: when maxmemory is enabled, use the noeviction or a volatile-* policy, not
+allkeys-*. SyncedMap checks Redis INFO memory during initialization and rejects
+unsafe policies. This policy must remain unchanged while the map is running.
 
 ## Redis failures
 

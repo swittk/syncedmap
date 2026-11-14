@@ -16,7 +16,7 @@ test -f "$tarball"
 mkdir -p "$work/consumer"
 cd "$work/consumer"
 printf '%s\n' '{"private":true,"type":"module"}' > package.json
-npm install --silent --no-audit --no-fund --ignore-scripts --omit=optional "$tarball" typescript@5.9.3 @types/node@22 >/dev/null
+npm install --silent --no-audit --no-fund --ignore-scripts "$tarball" typescript@5.9.3 @types/node@22 >/dev/null
 echo "== Local-only external install without Redis peers =="
 node -e "try{require.resolve('ioredis');process.exitCode=1}catch(e){if(e.code!=='MODULE_NOT_FOUND')throw e}"
 node -e "try{require.resolve('redlock');process.exitCode=1}catch(e){if(e.code!=='MODULE_NOT_FOUND')throw e}"

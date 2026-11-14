@@ -177,10 +177,11 @@ describe('real Redis replication', () => {
     await eventually(() => second.get('ordered') === 456);
     const redis = new Redis(url);
     try {
-      const channel = 'syncedmap:{revisions}:events';
-      await redis.publish(channel, JSON.stringify({
+      const channel = 'syncedmap:{revisions}:db:0:events';
+      const delivered = await redis.publish(channel, JSON.stringify({
         key: 'ordered', revision: 1, record: '1|0|0', origin: 'fake-old-peer',
       }));
+      expect(delivered).toBeGreaterThanOrEqual(2);
       await sleep(40);
       expect(second.get('ordered')).toBe(456);
 
@@ -551,6 +552,63 @@ describe('real Redis replication', () => {
       client.disconnect();
     }
   }, 14000);
+
+  it('rejects unsafe absolute Redis expiry before mutating the revision counter or record', async () => {
+    const map = openMap('too-large-ttl');
+    await map.ready();
+    await map.set('existing', 1);
+    const client = new Redis(url);
+    try {
+      const revisionKey = 'syncedmap:{too-large-ttl}:revision';
+      const revisionBefore = await client.get(revisionKey);
+      await expect(map.set('existing', 2, { ttlMs: Number.MAX_SAFE_INTEGER }))
+        .rejects.toThrow(/expiration exceeds/);
+      await expect(map.set('new', 4, { ttlMs: Number.MAX_SAFE_INTEGER }))
+        .rejects.toThrow(/expiration exceeds/);
+      await expect(map.update('existing', v => (v ?? 0) + 1, {
+        ttlMs: Number.MAX_SAFE_INTEGER,
+      })).rejects.toThrow(/expiration exceeds/);
+      expect(await client.get(revisionKey)).toBe(revisionBefore);
+      expect(await map.getFresh('existing')).toBe(1);
+      expect(await map.getFresh('new')).toBeUndefined();
+      expect(await map.update('existing', v => (v ?? 0) + 1)).toBe(2);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  it('rejects an evictable Redis revision counter at startup but accepts volatile eviction', async () => {
+    const client = new Redis(url);
+    try {
+      await client.config('SET', 'maxmemory', '67108864');
+      await client.config('SET', 'maxmemory-policy', 'allkeys-lru');
+      const rejected = new SyncedMap<string, number>({
+        namespace: 'eviction-is-unsafe',
+        redis: { url },
+      });
+      try {
+        await expect(rejected.ready()).rejects.toThrow(/maxmemory-policy/);
+      } finally {
+        await rejected.dispose();
+      }
+      await client.config('SET', 'maxmemory-policy', 'volatile-lru');
+      const accepted = new SyncedMap<string, number>({
+        namespace: 'volatile-is-safe',
+        redis: { url },
+      });
+      try {
+        await accepted.ready();
+        await accepted.set('key', 1);
+        expect(await accepted.getFresh('key')).toBe(1);
+      } finally {
+        await accepted.dispose();
+      }
+    } finally {
+      await client.config('SET', 'maxmemory-policy', 'noeviction');
+      await client.config('SET', 'maxmemory', '0');
+      client.disconnect();
+    }
+  }, 16000);
 
   it('synchronizes real separate Node processes, not just instances in one process', async () => {
     const namespace = 'processes';

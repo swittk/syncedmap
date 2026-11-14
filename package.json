@@ -39,7 +39,6 @@
     "redlock": "5.0.0-beta.2",
     "tsup": "^8.5.0",
     "typescript": "^5.9.3",
-    "uniquemutexmanager": "0.2.0",
     "vitest": "^3.2.0",
     "acorn": "^8.15.0"
   },
