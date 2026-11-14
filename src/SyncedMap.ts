@@ -334,7 +334,9 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   }
 
   private emit(change: SyncedMapChange<Key, Value>): void {
-    for (const listener of this.listeners) {
+    // Callbacks may unsubscribe/re-subscribe. A live Set iterator would
+    // revisit newly appended entries indefinitely during this notification.
+    for (const listener of [...this.listeners]) {
       try {
         listener(change);
       } catch (error) {

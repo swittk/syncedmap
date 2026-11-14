@@ -192,6 +192,31 @@ describe('SyncedMap local mode', () => {
     expect(await map.update('existing', v => (v ?? 0) + 1)).toBe(2);
   });
 
+  it('snapshots listeners when callbacks modify subscriptions', async () => {
+    const map = createMap<number>();
+    const calls: string[] = [];
+    let stopSelf: () => void = () => undefined;
+    const self = () => {
+      calls.push('self');
+      stopSelf();
+      stopSelf = map.subscribe(self);
+    };
+    stopSelf = map.subscribe(self);
+    const stopOther = map.subscribe(() => {
+      calls.push('other');
+      map.subscribe(() => calls.push('new'));
+    });
+    await map.set('key', 1);
+    expect(calls).toEqual(['self', 'other']);
+    await map.set('key', 2);
+    // The 'new' observer from the first write runs once on the second,
+    // but observers subscribed during the current notification wait until
+    // the next event instead of joining the live iteration.
+    expect(calls).toEqual(['self', 'other', 'other', 'self', 'new']);
+    stopSelf();
+    stopOther();
+  });
+
   it('publishes writes and protects against returning live input objects', async () => {
     const map = createMap<{ score: number }>();
     const observed: string[] = [];
