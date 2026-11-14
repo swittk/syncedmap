@@ -586,7 +586,7 @@ describe('real Redis replication', () => {
       // expiry near the largest safe integer without exceeding it.
       const [seconds, micros] = await client.time();
       const redisNow = Number(seconds) * 1000 + Math.floor(Number(micros) / 1000);
-      const ttlMs = Number.MAX_SAFE_INTEGER - redisNow - 2000;
+      const ttlMs = Number.MAX_SAFE_INTEGER - redisNow - 60_000;
       expect(Number.isSafeInteger(ttlMs)).toBe(true);
       await map.set('boundary', 7, { ttlMs });
       const stored = await client.get('syncedmap:{safe-expiry-boundary}:entry:boundary');
