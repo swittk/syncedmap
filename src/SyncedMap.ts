@@ -51,7 +51,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private readonly redisPrefix: string;
   private readonly entryPrefix: string;
   private readonly revisionKey: string;
-  private readonly eventChannel: string;
+  private eventChannel: string;
   private readonly defaultTtlMs: number;
   private readonly errorHandler?: (error: Error) => void;
   private readonly listeners = new Set<(change: SyncedMapChange<Key, Value>) => void>();
@@ -175,6 +175,13 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
     const redis = this.redis;
     if (!redis) throw new Error('Unable to initialize the SyncedMap Redis connection.');
+    // Redis Pub/Sub is shared across SELECTed databases. Scope the channel to
+    // the client's configured database, just as Redis scopes stored keys.
+    const database = redis.options?.db;
+    if (!Number.isSafeInteger(database) || database === undefined || database < 0) {
+      throw new TypeError('SyncedMap requires a Redis client with a valid options.db.');
+    }
+    this.eventChannel = this.redisPrefix + ':db:' + database + ':events';
     redis.on('error', this.onCommandError);
     if (this.ownsRedis) await this.duringInitialization(redis.connect());
     if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
@@ -433,7 +440,15 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     const run = async () => {
       do {
         this.resyncAgain = false;
-        await this.performResync();
+        try {
+          await this.performResync();
+        } catch (error) {
+          // A reconnect that arrived during a failed scan still needs its
+          // separately requested reconciliation. Without that request, fail
+          // normally rather than retrying indefinitely on persistent errors.
+          if (!this.resyncAgain || this.disposed) throw error;
+          this.reportError(error);
+        }
       } while (this.resyncAgain && !this.disposed);
     };
     const job = run();

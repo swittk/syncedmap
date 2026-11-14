@@ -454,6 +454,104 @@ describe('real Redis replication', () => {
     }
   }, 12000);
 
+  it('isolates Pub/Sub replication for equal namespaces in different Redis databases', async () => {
+    const namespace = 'database-isolation';
+    const dbZero = openMap(namespace);
+    const dbOneURL = new SyncedMap<string, number>({
+      namespace, redis: { url: url + '/1' },
+      onError: error => { backgroundErrors.push(error); },
+    });
+    const dbOneClient = new Redis(url + '/1');
+    const dbOnePeer = new SyncedMap<string, number>({
+      namespace, redis: { client: dbOneClient },
+      onError: error => { backgroundErrors.push(error); },
+    });
+    try {
+      await Promise.all([dbZero.ready(), dbOneURL.ready(), dbOnePeer.ready()]);
+      expect(dbOneClient.options.db).toBe(1);
+
+      await dbZero.set('shared', 10);
+      await dbZero.set('shared', 20); // Different revision numbers across databases.
+      await sleep(60);
+      expect(dbOneURL.get('shared')).toBeUndefined();
+      expect(dbOnePeer.get('shared')).toBeUndefined();
+
+      await dbOneURL.set('shared', 91);
+      await eventually(() => dbOnePeer.get('shared') === 91);
+      expect(dbZero.get('shared')).toBe(20);
+
+      await dbZero.set('shared', 30);
+      await sleep(60);
+      expect(dbOnePeer.get('shared')).toBe(91);
+      await dbOnePeer.set('shared', 92);
+      await eventually(() => dbOneURL.get('shared') === 92);
+      expect(await dbZero.getFresh('shared')).toBe(30);
+      expect(await dbOnePeer.getFresh('shared')).toBe(92);
+      await Promise.all([dbZero.resync(), dbOneURL.resync(), dbOnePeer.resync()]);
+      expect(dbZero.get('shared')).toBe(30);
+      expect(dbOneURL.get('shared')).toBe(92);
+    } finally {
+      await Promise.all([dbOneURL.dispose(), dbOnePeer.dispose()]);
+      dbOneClient.disconnect();
+    }
+  }, 14000);
+
+  it('drains a reconnect-triggered resync even when the preceding scan fails', async () => {
+    const namespace = 'retry-after-reconnect';
+    const writer = openMap(namespace);
+    await writer.ready();
+    await writer.set('tracked', 1);
+
+    const client = new Redis(url);
+    const observedErrors: Error[] = [];
+    const replica = new SyncedMap<string, number>({
+      namespace, redis: { client }, resyncIntervalMs: 0,
+      onError: error => { observedErrors.push(error); },
+    });
+    await replica.ready();
+
+    const originalMget = client.mget.bind(client);
+    let calls = 0;
+    let releaseScan: () => void = () => undefined;
+    const scanGate = new Promise<void>(resolve => { releaseScan = resolve; });
+    let markScanBlocked: () => void = () => undefined;
+    const scanBlocked = new Promise<void>(resolve => { markScanBlocked = resolve; });
+    client.mget = (async (...keys: string[]) => {
+      calls++;
+      if (calls === 1) {
+        markScanBlocked();
+        await scanGate;
+        throw new Error('Injected first-scan failure');
+      }
+      return originalMget(...keys);
+    }) as typeof client.mget;
+    let completedResyncs = 0;
+    replica.subscribe(change => {
+      if (change.type === 'resync') completedResyncs++;
+    });
+
+    try {
+      const firstAttempt = replica.resync();
+      await scanBlocked;
+      // ioredis emits ready after a subscriber reconnect. This asks runResync
+      // to reconcile again while the current (about-to-fail) scan is active.
+      const subscriber = (replica as unknown as { subscriber: Redis }).subscriber;
+      subscriber.emit('ready');
+      await writer.set('tracked', 2);
+      releaseScan();
+      await firstAttempt;
+      expect(calls).toBe(2);
+      expect(completedResyncs).toBe(1);
+      expect(replica.get('tracked')).toBe(2);
+      expect(observedErrors.map(error => error.message)).toEqual(['Injected first-scan failure']);
+    } finally {
+      releaseScan();
+      client.mget = originalMget as typeof client.mget;
+      await replica.dispose();
+      client.disconnect();
+    }
+  }, 14000);
+
   it('synchronizes real separate Node processes, not just instances in one process', async () => {
     const namespace = 'processes';
     const main = openMap(namespace);

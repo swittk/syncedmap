@@ -92,22 +92,28 @@ cat > redis.cjs <<'JS'
 const { SyncedMap } = require('syncedmap');
 (async () => {
   const map = new SyncedMap({namespace:'smoke:redis',redis:{url:process.env.COMPAT_REDIS_URL}});
-  await map.ready();
-  await map.set('count', 1);
-  if (await map.readLocked('count', async value => value) !== 1) throw Error('CJS locked read');
-  await map.dispose();
-  console.log('redis CJS OK');
+  try {
+    await map.ready();
+    await map.set('count', 1);
+    if (await map.readLocked('count', async value => value) !== 1) throw Error('CJS locked read');
+    console.log('redis CJS OK');
+  } finally {
+    await map.dispose();
+  }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 JS
 cat > redis.mjs <<'JS'
 import { SyncedMap } from 'syncedmap';
 const map = new SyncedMap({namespace:'smoke:redis',redis:{url:process.env.COMPAT_REDIS_URL}});
-await map.ready();
-if (map.get('count') !== 1) throw Error('ESM hydration');
-await map.update('count', n => n + 1);
-if (await map.getFresh('count') !== 2) throw Error('ESM update');
-await map.dispose();
-console.log('redis ESM OK');
+try {
+  await map.ready();
+  if (map.get('count') !== 1) throw Error('ESM hydration');
+  await map.update('count', n => n + 1);
+  if (await map.getFresh('count') !== 2) throw Error('ESM update');
+  console.log('redis ESM OK');
+} finally {
+  await map.dispose();
+}
 JS
 node redis.cjs
 node redis.mjs

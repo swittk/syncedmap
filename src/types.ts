@@ -15,8 +15,11 @@ export interface SyncedMapRedisClient extends RedisClientLike {
   disconnect(): void;
   quit(): Promise<unknown>;
   removeListener(event: string, listener: (...args: any[]) => void): unknown;
-  /** ioredis applies this prefix to keyed commands but not SCAN patterns. */
-  options?: { keyPrefix?: string };
+  /** ioredis applies this prefix to keyed commands but not SCAN patterns.
+   * db must identify the selected database; changing it after construction
+   * is unsupported because the replication subscription is database-scoped.
+   */
+  options?: { keyPrefix?: string; db?: number };
 }
 
 export type SyncedMapRedisConfig =

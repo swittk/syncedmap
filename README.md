@@ -40,6 +40,9 @@ Install the optional Redis peer packages only when using the Redis backend (iore
 Alternatively pass an existing ioredis client through redis: { client }.
 SyncedMap uses it for Redis commands and UMM locks, creates one separate
 subscriber connection, and never closes the caller-owned command client.
+The client's configured options.db selects the database; Pub/Sub is scoped by
+that database so equal namespaces in different Redis databases stay isolated.
+Changing a supplied client's selected database after construction is unsupported.
 
 **Use a separate namespace and security/deployment boundary per tenant.**
 Namespaces are not an authorization mechanism.
@@ -52,10 +55,11 @@ Namespaces are not an authorization mechanism.
       assertLock(); // detect lost lease before irreversible work
     });
 
-readLocked(key, callback) guarantees that the callback begins with the latest
-committed authoritative value at the locked read and that other *cooperating*
-SyncedMap writers cannot acquire that key's mutex until the callback completes.
-The lock spans the entire callback, rather than only the initial fetch.
+readLocked(key, callback) begins with the latest committed authoritative value
+at the locked read. Other *cooperating* SyncedMap writers cannot acquire that
+key's mutex **while the UMM lease remains valid**. The lock spans the callback,
+rather than only the initial fetch, but expiration or loss of the lease can
+allow another writer to enter before the callback finishes (see below).
 
 getFresh(key) reads Redis without locking; another writer can change the value
 immediately afterward.
