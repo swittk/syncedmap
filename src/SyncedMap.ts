@@ -641,8 +641,15 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
    */
   private async readClusterTopology(cluster: SyncedMapRedisClusterClient): Promise<string> {
     // CLUSTER SLOTS alone does NOT update ioredis's node inventory. Refresh
-    // the connection pool before taking a snapshot or collecting clear targets.
-    // This also works when the caller disables periodic slot refreshes.
+    // before scanning, including when automatic slot refresh is disabled.
+    // ioredis 5.0 calls overlapping refresh callbacks on the next tick,
+    // before the active refresh finishes. Let it finish, then start our own
+    // refresh so its callback really means the node inventory is current.
+    const state = cluster as SyncedMapRedisClusterClient & { isRefreshing?: boolean };
+    while (state.isRefreshing) {
+      if (this.disposed) throw new Error('SyncedMap disposed while refreshing Redis Cluster slots.');
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
     await new Promise<void>((resolve, reject) =>
       cluster.refreshSlotsCache(error => error ? reject(error) : resolve())
     );

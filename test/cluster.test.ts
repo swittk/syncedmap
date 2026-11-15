@@ -605,6 +605,79 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     }
   }, 20000);
 
+  it('does not accept an overlapping ioredis 5.0.0 slot refresh as complete', async () => {
+    const client = new LegacyCluster(
+      [{ host: '127.0.0.1', port: basePort }],
+      { slotsRefreshInterval: 0 }
+    );
+    client.on('error', () => undefined);
+    clients.push(client as unknown as Cluster);
+    const namespace = 'legacy-overlapping-refresh';
+    const map = new SyncedMap<string, number>({
+      namespace, redis: { client }, resyncIntervalMs: 0,
+    });
+    maps.push(map);
+    await map.ready();
+    await map.set('must-delete', 57);
+
+    const fullKey = 'syncedmap:{' + namespace + '}:entry:must-delete';
+    const slot = Number(await client.cluster('KEYSLOT', fullKey));
+    const ownerPort = Number(client.slots[slot]![0]!.split(':').at(-1));
+    const originalNodes = client.nodes.bind(client);
+    const owningMaster = originalNodes('master').find(node => node.options.port === ownerPort);
+    expect(owningMaster).toBeDefined();
+
+    const internal = client as unknown as {
+      getInfoFromNode(node: unknown, callback: (...args: unknown[]) => void): void;
+    };
+    const originalGetInfo = internal.getInfoFromNode.bind(client);
+    let unblock!: () => void;
+    const gate = new Promise<void>(resolve => { unblock = resolve; });
+    let signalStarted!: () => void;
+    const started = new Promise<void>(resolve => { signalStarted = resolve; });
+    let first = true;
+    let refreshed = false;
+    internal.getInfoFromNode = (node, callback) => {
+      if (first) {
+        first = false;
+        signalStarted();
+        void gate.then(() => originalGetInfo(node, callback));
+      } else {
+        originalGetInfo(node, callback);
+      }
+    };
+    client.nodes = ((role: 'all' | 'master' | 'slave' = 'all') => {
+      const nodes = originalNodes(role);
+      // Simulate a reshard completed while the cached inventory still lacks
+      // the actual owner; it appears only after the in-flight refresh.
+      return !refreshed && role === 'master'
+        ? nodes.filter(node => node !== owningMaster)
+        : nodes;
+    }) as typeof client.nodes;
+    client.once('refresh', () => { refreshed = true; });
+
+    let clearJob: Promise<void> | undefined;
+    try {
+      client.refreshSlotsCache(); // Leave an actual ioredis 5.0 refresh in progress.
+      await started;
+      expect((client as unknown as { isRefreshing: boolean }).isRefreshing).toBe(true);
+      let finished = false;
+      clearJob = map.clear().then(() => { finished = true; });
+      await sleep(40);
+      expect(finished).toBe(false);
+      expect(await map.getFresh('must-delete')).toBe(57);
+      unblock();
+      await clearJob;
+      expect(refreshed).toBe(true);
+      expect(await map.getFresh('must-delete')).toBeUndefined();
+    } finally {
+      unblock();
+      await clearJob?.catch(() => undefined);
+      client.nodes = originalNodes as typeof client.nodes;
+      internal.getInfoFromNode = originalGetInfo;
+    }
+  }, 18000);
+
   it('retries a scan that missed keys during a Cluster topology transition', async () => {
     const client = newClient();
     const writer = openMap('cluster-topology-retry', client);
