@@ -10,7 +10,7 @@ cleanup() {
 trap cleanup EXIT
 cd "$repo"
 npm run build >/dev/null
-tarball_name="$(npm pack --silent --ignore-scripts --pack-destination "$work" | tail -n 1)"
+tarball_name="$(npm pack --json=false --silent --ignore-scripts --pack-destination "$work" | tail -n 1)"
 tarball="$work/$tarball_name"
 test -f "$tarball"
 mkdir -p "$work/consumer"
