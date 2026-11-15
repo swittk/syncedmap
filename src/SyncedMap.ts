@@ -34,8 +34,9 @@ function isClusterClient(client: SyncedMapRedisConnection): client is SyncedMapR
 // ClusterSubscriber.getInstance() is present in the supported ioredis 5.x
 // implementations; fail initialization rather than silently lose recovery.
 type ClusterSubscriptionSocket = {
-  on(event: 'end', listener: () => void): unknown;
-  removeListener(event: 'end', listener: () => void): unknown;
+  status?: string;
+  on(event: 'close' | 'ready' | 'end', listener: () => void): unknown;
+  removeListener(event: 'close' | 'ready' | 'end', listener: () => void): unknown;
 };
 
 function getClusterSubscriptionSocket(client: SyncedMapRedisClusterClient): ClusterSubscriptionSocket | null {
@@ -141,11 +142,22 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private observedClusterSubscriptionSocket?: ClusterSubscriptionSocket;
   private clusterRecoveryJob?: Promise<void>;
   private clusterRecoveryNeeded = false;
+  private readonly onClusterSubscriptionClose = () => {
+    if (!this.disposed && this.redisSubscribed) this.clusterRecoveryNeeded = true;
+  };
+  private readonly onClusterSubscriptionReady = () => {
+    if (!this.disposed && this.clusterRecoveryNeeded) this.requestClusterRecovery();
+  };
   private readonly onClusterSubscriptionEnd = () => {
     if (this.disposed || !this.redisSubscribed) return;
-    // ioredis replaces the physical socket on 'end', without emitting
-    // 'ready' on the enclosing Cluster. Defer until its selector has run.
-    void Promise.resolve().then(() => this.requestClusterRecovery()).catch(error => this.reportError(error));
+    this.clusterRecoveryNeeded = true;
+    // Newer ioredis replaces its physical Pub/Sub socket on 'end'; 5.0 can
+    // reconnect the same socket after close/reconnecting instead. Watch the
+    // replacement after ioredis has chosen it, then reconcile on 'ready'.
+    void Promise.resolve().then(() => {
+      this.watchClusterSubscriptionSocket();
+      this.requestClusterRecovery();
+    }).catch(error => this.reportError(error));
   };
   private cancelInitialization: () => void = () => undefined;
   private readonly initializationStopped = new Promise<void>(resolve => {
@@ -216,9 +228,20 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (!subscriber || !isClusterClient(subscriber)) return;
     const socket = getClusterSubscriptionSocket(subscriber);
     if (!socket || socket === this.observedClusterSubscriptionSocket) return;
-    this.observedClusterSubscriptionSocket?.removeListener('end', this.onClusterSubscriptionEnd);
+    this.unwatchClusterSubscriptionSocket();
     this.observedClusterSubscriptionSocket = socket;
+    socket.on('close', this.onClusterSubscriptionClose);
+    socket.on('ready', this.onClusterSubscriptionReady);
     socket.on('end', this.onClusterSubscriptionEnd);
+  }
+
+  private unwatchClusterSubscriptionSocket(): void {
+    const socket = this.observedClusterSubscriptionSocket;
+    if (!socket) return;
+    socket.removeListener('close', this.onClusterSubscriptionClose);
+    socket.removeListener('ready', this.onClusterSubscriptionReady);
+    socket.removeListener('end', this.onClusterSubscriptionEnd);
+    this.observedClusterSubscriptionSocket = undefined;
   }
 
   /** Repair messages lost while the Cluster's own subscriber reconnects. */
@@ -228,8 +251,18 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (this.clusterRecoveryJob) return;
     const repair = async () => {
       while (this.clusterRecoveryNeeded && !this.disposed) {
-        this.clusterRecoveryNeeded = false;
         this.watchClusterSubscriptionSocket();
+        // The old Pub/Sub connection may have ended before ioredis could
+        // select a replacement. Wait until the physical socket is ready
+        // before resubscribing, even if replacement is delayed.
+        if (this.observedClusterSubscriptionSocket?.status !== 'ready') {
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 200);
+            timer.unref?.();
+          });
+          continue;
+        }
+        this.clusterRecoveryNeeded = false;
         try {
           // performResync first re-subscribes, then reads authoritative state.
           await this.runResync();
@@ -238,8 +271,6 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
           if (this.disposed) break;
           this.reportError(error);
           this.clusterRecoveryNeeded = true;
-          // Retry only after a real subscription outage, not on the normal
-          // read/write path or when periodic reconciliation is disabled.
           await new Promise<void>(resolve => {
             const timer = setTimeout(resolve, 500);
             timer.unref?.();
@@ -561,6 +592,25 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
   }
 
+  /** CLUSTER SLOTS is unchanged while slots are migrating/importing.
+   * Only stable placement is safe for scans that visit primaries in order.
+   */
+  private async readClusterTopology(cluster: SyncedMapRedisClusterClient): Promise<string> {
+    const masters = cluster.nodes('master');
+    if (masters.length === 0) throw new Error('No Redis Cluster primary nodes available.');
+    const [slots, nodeStates] = await Promise.all([
+      cluster.cluster('SLOTS'),
+      Promise.all(masters.map(node =>
+        (node as SyncedMapRedisClient & { cluster(command: string): Promise<string> })
+          .cluster('NODES')
+      )),
+    ]);
+    if (nodeStates.some(state => /\[\d+-(?:>|<)-[0-9a-f]+\]/i.test(state))) {
+      throw new Error('Redis Cluster slot migration is in progress; cannot safely scan namespace.');
+    }
+    return JSON.stringify(slots);
+  }
+
   /** Build one full snapshot; never install it before checking Cluster topology. */
   private async readRedisSnapshot(
     redis: SyncedMapRedisConnection
@@ -603,7 +653,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     // already maintained by the local heap. Explicit/reconnect resyncs always
     // rehydrate, and volatile-* eviction policies must always do a full scan.
     const cluster = isClusterClient(redis) ? redis : undefined;
-    const topology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
+    const topology = cluster ? await this.readClusterTopology(cluster) : undefined;
     const tooManyTombstones = this.versionsByKey.size > this.entriesByKey.size + 512;
     if (periodic && this.canSkipUnchangedResync &&
         this.lastHydrationRevision !== undefined && !tooManyTombstones &&
@@ -621,10 +671,10 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       // walks them. An unstable scan is incomplete, even if no write changed
       // the revision counter. Retry against a fresh topology and baseline;
       // never replace a good replica with a known-incomplete snapshot.
-      for (let attempt = 0; attempt < (cluster ? 3 : 1); attempt++) {
+      for (let attempt = 0; attempt < (cluster ? 6 : 1); attempt++) {
         const scanTopology = attempt === 0
           ? topology
-          : JSON.stringify(await cluster!.cluster('SLOTS'));
+          : await this.readClusterTopology(cluster!);
         const baselineRaw = await redis.get(this.revisionKey);
         const baseline = Number(baselineRaw ?? '0');
         if (!Number.isSafeInteger(baseline) || baseline < 0) {
@@ -632,10 +682,19 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
         }
         const { values, versions } = await this.readRedisSnapshot(redis);
         // No awaits between taking pending events and replaying them.
-        const afterTopology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
+        const afterTopology = cluster ? await this.readClusterTopology(cluster) : undefined;
         if (scanTopology !== afterTopology) {
-          if (attempt < 2) continue;
-          throw new Error('Redis Cluster topology changed repeatedly during SyncedMap reconciliation.');
+          if (attempt === 5) {
+            throw new Error('Redis Cluster topology changed repeatedly during SyncedMap reconciliation.');
+          }
+          // After a failover, different primaries may temporarily report
+          // different slot maps. Give gossip/election a brief opportunity
+          // to converge rather than retrying six scans in one tight burst.
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, Math.min(80 * 2 ** attempt, 1000));
+            timer.unref?.();
+          });
+          continue;
         }
         if (this.disposed) throw new Error('SyncedMap disposed during reconciliation.');
         const pending = this.bufferedEvents;
@@ -873,17 +932,31 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
    */
   async clear(): Promise<void> {
     await this.ready();
-    const targets = new Set<Key>();
+    let targets = new Set<Key>();
     if (this.redis) {
       // Collect before deleting: mutating the keyspace while scanning can
-      // skip keys. Keep deletion concurrency bounded to avoid Redis overload.
-      for await (const keys of this.scanEntryKeys()) {
-        for (const fullKey of keys) {
-          targets.add(decodeURIComponent(fullKey.slice(this.entryPrefix.length)) as Key);
+      // skip keys. A Cluster reshard can move entries between two scans,
+      // so verify stable topology before assigning any deletion workers.
+      const cluster = isClusterClient(this.redis) ? this.redis : undefined;
+      for (let attempt = 0; attempt < (cluster ? 3 : 1); attempt++) {
+        const before = cluster ? await this.readClusterTopology(cluster) : undefined;
+        const collected = new Set<Key>();
+        for await (const keys of this.scanEntryKeys()) {
+          for (const fullKey of keys) {
+            collected.add(decodeURIComponent(fullKey.slice(this.entryPrefix.length)) as Key);
+          }
+        }
+        const after = cluster ? await this.readClusterTopology(cluster) : undefined;
+        if (before === after) {
+          targets = collected;
+          break;
+        }
+        if (attempt === 2) {
+          throw new Error('Redis Cluster topology changed repeatedly during SyncedMap clear().');
         }
       }
     } else {
-      for (const key of this.entriesByKey.keys()) targets.add(key);
+      targets = new Set(this.entriesByKey.keys());
     }
 
     const iterator = targets.values();
@@ -916,8 +989,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.cancelInitialization();
     if (this.resyncTimer) clearInterval(this.resyncTimer);
     this.clusterRecoveryNeeded = false;
-    this.observedClusterSubscriptionSocket?.removeListener('end', this.onClusterSubscriptionEnd);
-    this.observedClusterSubscriptionSocket = undefined;
+    this.unwatchClusterSubscriptionSocket();
     this.expiryQueue.dispose();
     this.listeners.clear();
     // Unblock connection/subscription attempts that are still initializing.

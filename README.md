@@ -76,8 +76,13 @@ reads, and writes are routed through the Cluster client. Periodic reconciliation
 also checks slot topology: a reshard or failover forces a full scan even if
 the revision counter appears unchanged. If topology changes *during* a full
 scan, SyncedMap retries instead of installing a potentially incomplete
-snapshot and rejects persistently unstable scans. Reconnection of the internal
-Cluster Pub/Sub socket also triggers a full repair, even with
+snapshot and rejects persistently unstable scans. Active MIGRATING/IMPORTING
+slots also block full scans and `clear()` until the migration completes;
+otherwise Redis could omit keys even when CLUSTER SLOTS looks unchanged.
+`clear()` retries key collection on topology changes before deleting any keys.
+
+Reconnection of the internal Cluster Pub/Sub socket triggers a full repair,
+including automatic same-socket reconnection in older ioredis 5.x, even with
 `resyncIntervalMs: 0`.
 
 Redis Cluster uses only database 0. Configure the Cluster client with

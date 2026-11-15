@@ -257,6 +257,52 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     }
   }, 25000);
 
+  it('repairs missed events when the SAME internal subscriber automatically reconnects', async () => {
+    const writer = openMap('cluster-same-subscriber-reconnect');
+    const reader = openMap('cluster-same-subscriber-reconnect');
+    await Promise.all([writer.ready(), reader.ready()]);
+    const cluster = (reader as unknown as { subscriber: Cluster }).subscriber;
+    const internal = (cluster as unknown as {
+      subscriber: {
+        getInstance(): {
+          status: string;
+          connector?: { stream?: { destroy(): void } };
+          options: { retryStrategy?: (times: number) => number | null };
+          once(event: 'close' | 'reconnecting' | 'ready', listener: () => void): void;
+        };
+      };
+    }).subscriber;
+    const socket = internal.getInstance();
+    expect(socket).toBeDefined();
+    expect(socket.connector?.stream).toBeDefined();
+    const previousStrategy = socket.options.retryStrategy;
+    let replaced = false;
+    let readyEvents = 0;
+    const watchReplacement = setInterval(() => {
+      if (internal.getInstance() !== socket) replaced = true;
+    }, 5);
+    const onReady = () => { readyEvents++; };
+    cluster.on('ready', onReady);
+    // Newer ioredis defaults to replacing the socket. A retryStrategy
+    // simulates the same-socket reconnect used by the supported 5.0 client.
+    socket.options.retryStrategy = () => 180;
+    const disconnected = new Promise<void>(resolve => socket.once('close', resolve));
+    try {
+      socket.connector!.stream!.destroy();
+      await disconnected;
+      await writer.set('missed', 66);
+      expect(reader.get('missed')).toBeUndefined();
+      await waitUntil(async () => reader.get('missed') === 66, 9000);
+      expect(replaced).toBe(false);
+      expect(internal.getInstance()).toBe(socket);
+      expect(readyEvents).toBe(0);
+    } finally {
+      clearInterval(watchReplacement);
+      cluster.removeListener('ready', onReady);
+      socket.options.retryStrategy = previousStrategy;
+    }
+  }, 15000);
+
   it('shares one command-client error observer across many namespaces', async () => {
     const client = newClient();
     await client.ping();
@@ -314,6 +360,98 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
       await otherPrimary.config('SET', 'maxmemory', '0');
     }
   }, 12000);
+
+  it('refuses scans while Redis Cluster slots are actively migrating', async () => {
+    const namespace = 'cluster-active-slot-migration';
+    const client = newClient();
+    const map = openMap(namespace, client);
+    await map.ready();
+    await map.set('preserve', 72);
+    const key = 'syncedmap:{' + namespace + '}:entry:preserve';
+    const slot = Number(await client.cluster('KEYSLOT', key));
+    const sourcePort = Number(client.slots[slot]![0]!.split(':').at(-1));
+    const destination = client.nodes('master').find(node => node.options.port !== sourcePort);
+    expect(destination).toBeDefined();
+    const destinationPort = destination!.options.port!;
+    const sourceId = await cli(sourcePort, 'CLUSTER', 'MYID');
+    const destinationId = await cli(destinationPort, 'CLUSTER', 'MYID');
+    const originalSlots = await client.cluster('SLOTS');
+    try {
+      expect(await cli(destinationPort, 'CLUSTER', 'SETSLOT', String(slot), 'IMPORTING', sourceId)).toBe('OK');
+      expect(await cli(sourcePort, 'CLUSTER', 'SETSLOT', String(slot), 'MIGRATING', destinationId)).toBe('OK');
+      const nodeState = await cli(sourcePort, 'CLUSTER', 'NODES');
+      expect(nodeState).toContain('[' + slot + '->-' + destinationId + ']');
+      // Redis still advertises the same slot owner while migrating: SLOTS
+      // comparison alone cannot detect this unstable scan.
+      expect(await client.cluster('SLOTS')).toEqual(originalSlots);
+      await expect(map.resync()).rejects.toThrow(/slot migration/);
+      await expect(map.clear()).rejects.toThrow(/slot migration/);
+      expect(map.get('preserve')).toBe(72);
+      expect(await map.getFresh('preserve')).toBe(72);
+    } finally {
+      await cli(sourcePort, 'CLUSTER', 'SETSLOT', String(slot), 'STABLE');
+      await cli(destinationPort, 'CLUSTER', 'SETSLOT', String(slot), 'STABLE');
+    }
+    await map.resync();
+    await map.clear();
+    expect(await map.getFresh('preserve')).toBeUndefined();
+  }, 20000);
+
+  it('retries clear target collection when Cluster topology changes during the scan', async () => {
+    const client = newClient();
+    const map = openMap('cluster-clear-topology-retry', client);
+    await map.ready();
+    await map.set('existing', 44);
+    const raw = client as unknown as { cluster(command: string): Promise<unknown> };
+    const originalTopology = raw.cluster.bind(client);
+    let topologyCalls = 0;
+    raw.cluster = async command => {
+      const value = await originalTopology(command);
+      if (command === 'SLOTS' && ++topologyCalls === 2) return ['topology changed'];
+      return value;
+    };
+    const primaries = client.nodes('master');
+    const originalScans = primaries.map(node => node.scan.bind(node));
+    let scans = 0;
+    for (let i = 0; i < primaries.length; i++) {
+      const node = primaries[i]!;
+      const scan = originalScans[i]!;
+      node.scan = ((...args: Parameters<typeof node.scan>) => {
+        scans++;
+        if (topologyCalls < 2) return Promise.resolve(['0', []]);
+        return scan(...args);
+      }) as typeof node.scan;
+    }
+    try {
+      await map.clear();
+      expect(topologyCalls).toBeGreaterThanOrEqual(4);
+      expect(scans).toBeGreaterThan(primaries.length);
+      expect(await map.getFresh('existing')).toBeUndefined();
+    } finally {
+      raw.cluster = originalTopology;
+      for (let i = 0; i < primaries.length; i++) {
+        primaries[i]!.scan = originalScans[i]! as typeof primaries[number]['scan'];
+      }
+    }
+  }, 20000);
+
+  it('rejects clear without deletion if Cluster keeps changing its topology', async () => {
+    const client = newClient();
+    const map = openMap('cluster-clear-topology-churn', client);
+    await map.ready();
+    await map.set('keep', 83);
+    const raw = client as unknown as { cluster(command: string): Promise<unknown> };
+    const original = raw.cluster.bind(client);
+    let generation = 0;
+    raw.cluster = async command =>
+      command === 'SLOTS' ? { generation: ++generation } : original(command);
+    try {
+      await expect(map.clear()).rejects.toThrow(/topology changed repeatedly/);
+      expect(await map.getFresh('keep')).toBe(83);
+    } finally {
+      raw.cluster = original;
+    }
+  }, 15000);
 
   it('retries a scan that missed keys during a Cluster topology transition', async () => {
     const client = newClient();
