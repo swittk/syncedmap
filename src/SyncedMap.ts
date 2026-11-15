@@ -6,7 +6,8 @@ import { READ_SCRIPT, WRITE_SCRIPT, encodeRecord, freezeValue, parseRecord, seri
 import type { StoredRecord } from './redisProtocol.js';
 import { SyncedMapConflictError } from './types.js';
 import type {
-  SyncedMapChange, SyncedMapLockContext, SyncedMapOptions, SyncedMapSetOptions, SyncedMapRedisClient,
+  SyncedMapChange, SyncedMapLockContext, SyncedMapOptions, SyncedMapSetOptions,
+  SyncedMapRedisClient, SyncedMapRedisClusterClient, SyncedMapRedisConnection,
 } from './types.js';
 
 type ReplicationEvent<Key extends string> = {
@@ -23,6 +24,42 @@ type CurrentState<Value> = {
 };
 
 type WriteAction = 'set' | 'delete';
+
+function isClusterClient(client: SyncedMapRedisConnection): client is SyncedMapRedisClusterClient {
+  return 'isCluster' in client && client.isCluster === true && typeof client.nodes === 'function';
+}
+
+// A supplied Redis/Cluster client can be shared by many maps. Keep one
+// EventEmitter listener per connection instead of hitting Node's 10-listener
+// warning and repeating the event-handler overhead for every namespace.
+const commandErrorObservers = new WeakMap<SyncedMapRedisConnection, {
+  dispatch: (error: Error) => void;
+  callbacks: Set<(error: Error) => void>;
+}>();
+
+function observeCommandErrors(
+  client: SyncedMapRedisConnection,
+  callback: (error: Error) => void
+): () => void {
+  let listeners = commandErrorObservers.get(client);
+  if (!listeners) {
+    const callbacks = new Set<(error: Error) => void>();
+    const dispatch = (error: Error) => {
+      for (const observer of [...callbacks]) observer(error);
+    };
+    listeners = { dispatch, callbacks };
+    commandErrorObservers.set(client, listeners);
+    client.on('error', dispatch);
+  }
+  listeners.callbacks.add(callback);
+  return () => {
+    listeners!.callbacks.delete(callback);
+    if (listeners!.callbacks.size === 0) {
+      client.removeListener('error', listeners!.dispatch);
+      commandErrorObservers.delete(client);
+    }
+  };
+}
 
 /** Redis cursor pages are larger than transport value batches. */
 const redisScanCount = 1000;
@@ -61,13 +98,14 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   /** Background scans can be skipped on a fully unchanged, non-evictable replica. */
   private lastHydrationRevision?: number;
   private canSkipUnchangedResync = false;
+  private lastHydrationTopology?: string;
   private readonly listeners = new Set<(change: SyncedMapChange<Key, Value>) => void>();
   /** Both local and Redis replicas expire cached entries without a full scan. */
   private readonly expiryQueue: ExpiryQueue<Key>;
 
   private mutex: UniqueMutexManager;
-  private redis?: SyncedMapRedisClient;
-  private subscriber?: SyncedMapRedisClient;
+  private redis?: SyncedMapRedisConnection;
+  private subscriber?: SyncedMapRedisConnection;
   private ownsRedis = false;
   private redisSubscribed = false;
   private readyFlag = false;
@@ -80,6 +118,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private readonly initialization: Promise<void>;
   private resyncTimer?: ReturnType<typeof setInterval>;
   private disposeJob?: Promise<void>;
+  private stopObservingCommandErrors?: () => void;
   private cancelInitialization: () => void = () => undefined;
   private readonly initializationStopped = new Promise<void>(resolve => {
     this.cancelInitialization = resolve;
@@ -172,8 +211,20 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (config.client) {
       // ioredis keyPrefix is applied to keyed commands but not SCAN patterns.
       // Refuse a configuration which would silently corrupt hydration/clear.
-      if (config.client.options?.keyPrefix) {
+      const client = config.client;
+      const keyPrefix = isClusterClient(client)
+        ? client.options?.redisOptions?.keyPrefix
+        : client.options?.keyPrefix;
+      if (keyPrefix) {
         throw new TypeError('SyncedMap does not support a Redis client with keyPrefix.');
+      }
+      if (isClusterClient(client) && client.options?.redisOptions?.db !== undefined &&
+          client.options.redisOptions.db !== 0) {
+        throw new TypeError('Redis Cluster only supports database 0.');
+      }
+      if (isClusterClient(client) && client.options.scaleReads !== undefined &&
+          client.options.scaleReads !== 'master') {
+        throw new TypeError('SyncedMap requires Redis Cluster scaleReads=master for authoritative replication.');
       }
       this.redis = config.client;
     } else {
@@ -183,28 +234,36 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
     const redis = this.redis;
     if (!redis) throw new Error('Unable to initialize the SyncedMap Redis connection.');
-    redis.on('error', this.onCommandError);
+    this.stopObservingCommandErrors = observeCommandErrors(redis, this.onCommandError);
     if (this.ownsRedis) await this.duringInitialization(redis.connect());
     if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
-    // Revision counters have no TTL, but Redis allkeys eviction can still
-    // discard them. That would restart revision numbering and silently drop
-    // acknowledged notifications. Verify this once, not on the hot path.
-    const memoryInfo = await this.duringInitialization(redis.info('memory'));
-    const maxmemory = /^maxmemory:(\d+)\s*$/m.exec(memoryInfo)?.[1];
-    const policy = /^maxmemory_policy:([^\r\n]+)\s*$/m.exec(memoryInfo)?.[1];
-    if (maxmemory === undefined || policy === undefined) {
-      throw new Error('SyncedMap requires Redis INFO memory to verify revision counter safety.');
+    // Commands without keys (including INFO) hit arbitrary Redis Cluster nodes.
+    // Check every discovered node, not an arbitrary cluster INFO target.
+    // Redis may not advertise replicas until replication is ready; operators
+    // must configure failover candidates with the same memory policy.
+    // A cluster client must first finish slot discovery.
+    const cluster = isClusterClient(redis) ? redis : undefined;
+    if (cluster) await this.duringInitialization(cluster.ping());
+    const nodes: SyncedMapRedisClient[] = cluster ? cluster.nodes('all') : [redis as SyncedMapRedisClient];
+    if (nodes.length === 0) throw new Error('No Redis Cluster nodes available.');
+    const memoryInfos = await this.duringInitialization(Promise.all(nodes.map(node => node.info('memory'))));
+    this.canSkipUnchangedResync = true;
+    for (const memoryInfo of memoryInfos) {
+      const maxmemory = /^maxmemory:(\d+)\s*$/m.exec(memoryInfo)?.[1];
+      const policy = /^maxmemory_policy:([^\r\n]+)\s*$/m.exec(memoryInfo)?.[1];
+      if (maxmemory === undefined || policy === undefined) {
+        throw new Error('SyncedMap requires Redis INFO memory to verify revision counter safety.');
+      }
+      if (Number(maxmemory) > 0 && policy.startsWith('allkeys-')) {
+        throw new Error('SyncedMap requires a noeviction or volatile-* Redis maxmemory-policy when maxmemory is enabled.');
+      }
+      if (Number(maxmemory) > 0 && policy !== 'noeviction') {
+        // Volatile-* evictions can delete entries without new revisions.
+        this.canSkipUnchangedResync = false;
+      }
     }
-    if (Number(maxmemory) > 0 && policy.startsWith('allkeys-')) {
-      throw new Error('SyncedMap requires a noeviction or volatile-* Redis maxmemory-policy when maxmemory is enabled.');
-    }
-    // Without memory-pressure eviction, only writes can change non-TTL keys;
-    // absolute TTLs are already tracked locally. Under volatile-* eviction,
-    // an early entry loss may have no revision change, so full scans remain.
-    this.canSkipUnchangedResync = Number(maxmemory) === 0 || policy === 'noeviction';
-    // Redis Pub/Sub is shared across SELECTed databases. Scope the channel to
-    // the client's configured database, just as Redis scopes stored keys.
-    const database = redis.options?.db;
+    // Cluster has only DB 0; standalone Redis can select another DB.
+    const database = cluster ? 0 : (redis as SyncedMapRedisClient).options?.db;
     if (!Number.isSafeInteger(database) || database === undefined || database < 0) {
       throw new TypeError('SyncedMap requires a Redis client with a valid options.db.');
     }
@@ -218,7 +277,11 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     });
     await this.duringInitialization(previous.dispose());
     if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
-    this.subscriber = redis.duplicate({ lazyConnect: true });
+    // ioredis Cluster.duplicate(startupNodes, options) has a different
+    // signature from Redis.duplicate(options).
+    this.subscriber = cluster
+      ? cluster.duplicate([], { lazyConnect: true })
+      : (redis as SyncedMapRedisClient).duplicate({ lazyConnect: true });
     const subscriber = this.subscriber;
     subscriber.on('error', error => {
       if (!this.disposed) this.reportError(error);
@@ -400,6 +463,26 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
   }
 
+  /** In Cluster mode SCAN is node-local. Examine every primary.
+   * Keyed MGET and EVAL still route via ioredis to the correct hash slot.
+   */
+  private async *scanEntryKeys(): AsyncIterableIterator<string[]> {
+    const redis = this.redis;
+    if (!redis) return;
+    const nodes = isClusterClient(redis) ? redis.nodes('master') : [redis as SyncedMapRedisClient];
+    if (nodes.length === 0) throw new Error('No Redis Cluster primary nodes available.');
+    for (const node of nodes) {
+      let cursor = '0';
+      do {
+        const [next, keys] = await node.scan(
+          cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', redisScanCount
+        );
+        cursor = next;
+        yield keys;
+      } while (cursor !== '0');
+    }
+  }
+
   /** Reconstruct state from Redis; pub/sub events arriving during SCAN are replayed. */
   private async performResync(periodic = false): Promise<void> {
     const redis = this.redis;
@@ -410,9 +493,13 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     // no writes and Redis cannot silently evict entries. Expiry itself is
     // already maintained by the local heap. Explicit/reconnect resyncs always
     // rehydrate, and volatile-* eviction policies must always do a full scan.
+    const cluster = isClusterClient(redis) ? redis : undefined;
+    const topology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
     const tooManyTombstones = this.versionsByKey.size > this.entriesByKey.size + 512;
     if (periodic && this.canSkipUnchangedResync &&
-        this.lastHydrationRevision !== undefined && !tooManyTombstones) {
+        this.lastHydrationRevision !== undefined && !tooManyTombstones &&
+        (!cluster || (this.lastHydrationTopology !== undefined &&
+            topology === this.lastHydrationTopology))) {
       const revision = await redis.get(this.revisionKey);
       if ((revision ?? '0') === String(this.lastHydrationRevision)) return;
     }
@@ -428,12 +515,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       }
       const values = new Map<Key, StoredRecord<Value>>();
       const versions = new Map<Key, number>();
-      let cursor = '0';
-      do {
-        const [nextCursor, keys] = await redis.scan(
-          cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', redisScanCount
-        );
-        cursor = nextCursor;
+      for await (const keys of this.scanEntryKeys()) {
         const batches: string[][] = [];
         for (let offset = 0; offset < keys.length; offset += redisReadBatchSize) {
           batches.push(keys.slice(offset, offset + redisReadBatchSize));
@@ -454,16 +536,19 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
             versions.set(key, entry.version);
           }
         }
-      } while (cursor !== '0');
+      }
+      // Resharding or failover can move entries without incrementing the
+      // revision. Check topology BEFORE the synchronous swap-and-replay: an
+      // await between taking pending events and replaying them drops updates.
+      const afterTopology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
       if (this.disposed) throw new Error('SyncedMap disposed during reconciliation.');
-      // This swap and event replay are synchronous, so subscriber callbacks
-      // cannot interleave between the snapshot and the buffered updates.
       const pending = this.bufferedEvents;
       this.entriesByKey = values;
       this.versionsByKey = versions;
       this.baselineRevision = baseline;
       this.expiryQueue.replace(values);
       this.lastHydrationRevision = baseline;
+      this.lastHydrationTopology = topology === afterTopology ? topology : undefined;
       this.bufferedEvents = new Map();
       this.buffering = false;
       // These mutations were already delivered to live subscribers. Replay
@@ -694,16 +779,11 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (this.redis) {
       // Collect before deleting: mutating the keyspace while scanning can
       // skip keys. Keep deletion concurrency bounded to avoid Redis overload.
-      let cursor = '0';
-      do {
-        const [next, keys] = await this.redis.scan(
-          cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', redisScanCount
-        );
-        cursor = next;
+      for await (const keys of this.scanEntryKeys()) {
         for (const fullKey of keys) {
           targets.add(decodeURIComponent(fullKey.slice(this.entryPrefix.length)) as Key);
         }
-      } while (cursor !== '0');
+      }
     } else {
       for (const key of this.entriesByKey.keys()) targets.add(key);
     }
@@ -750,7 +830,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     // new resources after this completes. Ignore expected shutdown errors.
     await this.initialization.catch(() => undefined);
     this.closeOwnedConnections();
-    this.redis?.removeListener('error', this.onCommandError);
+    this.stopObservingCommandErrors?.();
     await this.mutex.dispose();
     this.closeOwnedConnections();
   }

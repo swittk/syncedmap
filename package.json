@@ -1,6 +1,6 @@
 {
   "name": "syncedmap",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Map-like local reads with optional Redis replication and coordinated operations",
   "license": "MIT",
   "type": "module",
