@@ -4,10 +4,11 @@ type ExpiryNode<Key extends string> = { key: Key; expiresAt: number };
 const MAX_TIMEOUT_MS = 0x7fffffff;
 
 /**
- * Only used in local mode. Unlike one timer per entry, memory and timer
- * overhead remain bounded by the number of live expiring keys.
+ * Maintains the active replica's TTLs in both local and Redis-backed modes.
+ * Unlike one timer per entry, memory and timer overhead remain bounded by
+ * the number of live expiring keys.
  */
-export class LocalExpiryQueue<Key extends string> {
+export class ExpiryQueue<Key extends string> {
   private readonly nodes: Array<ExpiryNode<Key>> = [];
   private readonly positions = new Map<Key, number>();
   private timer?: ReturnType<typeof setTimeout>;
@@ -87,6 +88,34 @@ export class LocalExpiryQueue<Key extends string> {
       this.removeAt(previous);
       this.schedule();
     }
+  }
+
+  get size(): number {
+    return this.nodes.length;
+  }
+
+  /** Restore an entire snapshot in O(N) time and schedule only once. */
+  replace(entries: Iterable<[Key, { expiresAt: number }]>): void {
+    if (this.disposed) return;
+    this.nodes.length = 0;
+    this.positions.clear();
+    for (const [key, entry] of entries) {
+      const expiresAt = entry.expiresAt;
+      if (expiresAt === 0) continue;
+      this.positions.set(key, this.nodes.length);
+      this.nodes.push({ key, expiresAt });
+    }
+    for (let index = Math.floor(this.nodes.length / 2) - 1; index >= 0; index--) {
+      this.sink(index);
+    }
+    this.expireDue();
+    this.schedule();
+  }
+
+  /** Flush overdue entries if a synchronous caller runs before the timer. */
+  expireDue(): void {
+    if (this.disposed || this.nodes.length === 0) return;
+    if (this.nodes[0]!.expiresAt <= Date.now()) this.expire();
   }
 
   private schedule(): void {

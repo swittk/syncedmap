@@ -1,10 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { LocalExpiryQueue } from '../src/localExpiryQueue.js';
+import { ExpiryQueue } from '../src/expiryQueue.js';
 
 /** Verify every mutation preserves the indexed min-heap invariant and bound. */
 describe('local expiration heap', () => {
+  it('rebuilds an expiration heap from a snapshot and expires values without stale nodes', async () => {
+    const expired: string[] = [];
+    const queue = new ExpiryQueue<string>((key) => expired.push(key));
+    try {
+      const now = Date.now();
+      const rows = new Map<string, { expiresAt: number }>();
+      for (let i = 0; i < 500; i++) {
+        rows.set('item-' + i, { expiresAt: now + 10000 + (i % 9) * 1000 });
+      }
+      rows.set('expired', { expiresAt: now - 1 });
+      rows.set('permanent', { expiresAt: 0 });
+      queue.replace(rows);
+      expect(queue.size).toBe(500);
+      expect(expired).toEqual(['expired']);
+      const internal = queue as unknown as {
+        nodes: Array<{ key: string; expiresAt: number }>;
+        positions: Map<string, number>;
+      };
+      for (let i = 0; i < internal.nodes.length; i++) {
+        const item = internal.nodes[i]!;
+        expect(internal.positions.get(item.key)).toBe(i);
+        if (i) expect(internal.nodes[Math.floor((i - 1) / 2)]!.expiresAt)
+          .toBeLessThanOrEqual(item.expiresAt);
+      }
+      queue.replace(new Map([['new', { expiresAt: now + 20000 }]]));
+      expect(queue.size).toBe(1);
+      expect(internal.positions.has('expired')).toBe(false);
+      expect(internal.positions.has('item-0')).toBe(false);
+      queue.replace(new Map());
+      expect(queue.size).toBe(0);
+    } finally {
+      queue.dispose();
+    }
+  });
+
   it('keeps one indexed entry per key through repeated upserts and removals', () => {
-    const queue = new LocalExpiryQueue<string>(() => undefined);
+    const queue = new ExpiryQueue<string>(() => undefined);
     const live = new Map<string, number>();
     let seed = 0x12345678;
     const next = (): number => {

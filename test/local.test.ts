@@ -142,12 +142,12 @@ describe('SyncedMap local mode', () => {
     const internal = map as unknown as {
       entriesByKey: Map<string, unknown>;
       versionsByKey: Map<string, number>;
-      localExpiryQueue: { nodes: unknown[]; positions: Map<string, number> };
+      expiryQueue: { nodes: unknown[]; positions: Map<string, number> };
     };
     expect(internal.entriesByKey.size).toBe(1);
     expect(internal.versionsByKey.size).toBe(1);
-    expect(internal.localExpiryQueue.nodes).toHaveLength(0);
-    expect(internal.localExpiryQueue.positions.size).toBe(0);
+    expect(internal.expiryQueue.nodes).toHaveLength(0);
+    expect(internal.expiryQueue.positions.size).toBe(0);
     expect(map.get('persist')).toBe(456);
     await map.delete('persist');
     expect(internal.entriesByKey.size).toBe(0);
@@ -215,6 +215,33 @@ describe('SyncedMap local mode', () => {
     expect(calls).toEqual(['self', 'other', 'other', 'self', 'new']);
     stopSelf();
     stopOther();
+  });
+
+  it('reports cached size without scanning entries and cleans overdue TTLs on demand', async () => {
+    const map = createMap<number>();
+    for (let i = 0; i < 120; i++) await map.set('entry-' + i, i);
+    const internal = map as unknown as {
+      currentValue: (value: unknown) => unknown;
+      expiryQueue: { expireDue: () => void };
+    };
+    const originalCurrentValue = internal.currentValue.bind(map);
+    let examined = 0;
+    internal.currentValue = (entry: unknown) => {
+      examined++;
+      return originalCurrentValue(entry);
+    };
+    try {
+      for (let i = 0; i < 1000; i++) expect(map.size).toBe(120);
+      expect(examined).toBe(0);
+      await map.set('temporary', 500, { ttlMs: 25 });
+      examined = 0; // The write itself may inspect the previous value.
+      expect(map.size).toBe(121);
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(map.size).toBe(120);
+      expect(examined).toBe(0);
+    } finally {
+      internal.currentValue = originalCurrentValue;
+    }
   });
 
   it('publishes writes and protects against returning live input objects', async () => {

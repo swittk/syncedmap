@@ -97,8 +97,11 @@ entries(), keys(), values(), and iteration are synchronous.
 2. Other nodes update their local Map immediately upon receiving the message.
 3. Revision checks reject out-of-order stale messages, including after deletion.
 4. Startup subscribes before SCAN hydration and replays buffered notifications.
-5. Subscriber reconnection triggers resynchronization. Periodic full
-   reconciliation (default 5 minutes) repairs missed Pub/Sub notifications.
+5. Subscriber reconnection triggers full resynchronization. Periodic
+   reconciliation (default 5 minutes) checks the revision first when Redis
+   cannot evict keys; unchanged namespaces avoid SCAN/MGET entirely.
+   Changed namespaces still receive a full scan. Volatile eviction policies
+   retain full scans because entries can disappear without new revisions.
 
 Pub/Sub has at-most-once delivery and is not an audit log. Distributed get()
 is eventually consistent. To force a refresh, await map.resync(), or use
@@ -127,13 +130,16 @@ millions of keys.
 - Redis handles physical key expiry, while local reads check absolute expiry
   without waiting for a Pub/Sub notification. Fresh Redis reads use Redis's
   expiry decision, not the Node.js clock, which may be skewed.
-- Local-only mode uses one timer and an indexed expiration queue to discard
-  expired entries even when there are no subsequent reads. Expiry bookkeeping
-  is O(log n) per changed expiring key and does not retain stale tombstones.
+- Every replica uses one timer and an indexed expiration queue to discard
+  expired cached entries even without subsequent reads. The synchronous size
+  read is O(1) unless due expirations must first be drained; TTL updates cost
+  O(log n). Redis replicas retain revision tombstones against late messages.
 - Time-based expiry cannot be frozen by a mutex. Expiry itself does not publish
   a SyncedMap delete notification.
-- clear() deletes keys individually and is not globally atomic; new writes
-  concurrent with clear() may remain.
+- clear() snapshots keys first, then deletes them with up to 32 concurrent
+  workers using the same per-key locks as individual writes. It is not
+  globally atomic; new writes concurrent with clear() may remain. If one
+  deletion fails, it waits for in-flight workers to settle before rejecting.
 
 ## Redis configuration
 
@@ -170,8 +176,8 @@ The suite covers local concurrency and **real Redis**, including separate Node
 processes. It starts and stops an ephemeral redis-server; ensure redis-server
 is on PATH. Builds provide ESM, CommonJS, and TypeScript declarations.
 
-Release status: initial standalone implementation.
-Not published to npm or integrated into any application.
+The package is published on npm. Redis integration is optional; no
+application-specific setup or deployment is bundled with the library.
 
 ## Compatibility
 
