@@ -36,6 +36,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "ioredis": "^5.8.2",
+    "ioredis-legacy": "npm:ioredis@5.0.0",
     "redlock": "5.0.0-beta.2",
     "tsup": "^8.5.0",
     "typescript": "^5.9.3",

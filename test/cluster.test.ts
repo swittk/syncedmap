@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { Cluster } from 'ioredis';
+import { Cluster as LegacyCluster } from 'ioredis-legacy';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SyncedMap, type SyncedMapRedisClusterClient } from '../src/index.js';
 
@@ -341,6 +342,69 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
       cluster.removeListener('ready', onOuterReady);
       strandedSocket.options.retryStrategy = originalRetry;
       strandedSocket.options.port = originalPort;
+    }
+  }, 18000);
+
+  it('recovers with real ioredis 5.0.0 when both background refresh intervals are disabled', async () => {
+    // The library supports the entire ioredis 5.x range. The 5.0.0 Cluster
+    // subscriber retries the same dead endpoint indefinitely, without
+    // emitting a top-level ready event. Exercise the actual older package,
+    // not only a simulated retry with the newer client.
+    const legacyVersion = (await import('ioredis-legacy/package.json')).version;
+    expect(legacyVersion).toBe('5.0.0');
+    const createLegacy = () => {
+      const client = new LegacyCluster(
+        [{ host: '127.0.0.1', port: basePort }],
+        { slotsRefreshInterval: 0 }
+      );
+      client.on('error', () => undefined);
+      clients.push(client as unknown as Cluster);
+      return client as unknown as Cluster;
+    };
+    const namespace = 'legacy-5-no-refresh';
+    const writer = new SyncedMap<string, number>({
+      namespace, redis: { client: createLegacy() }, resyncIntervalMs: 0,
+    });
+    const reader = new SyncedMap<string, number>({
+      namespace, redis: { client: createLegacy() }, resyncIntervalMs: 0,
+    });
+    maps.push(writer, reader);
+    await Promise.all([writer.ready(), reader.ready()]);
+    await writer.set('baseline', 10);
+    await waitUntil(async () => reader.get('baseline') === 10);
+
+    const cluster = (reader as unknown as { subscriber: Cluster }).subscriber;
+    const internal = (cluster as unknown as {
+      subscriber: {
+        getInstance(): {
+          options: { port: number; retryStrategy?: (times: number) => number | null };
+          connector?: { stream?: { destroy(): void } };
+          once(event: 'close', listener: () => void): void;
+        };
+      };
+    }).subscriber;
+    const socket = internal.getInstance();
+    expect(socket.connector?.stream).toBeDefined();
+    const oldPort = socket.options.port;
+    const oldRetryStrategy = socket.options.retryStrategy;
+    let outerReadyEvents = 0;
+    const onOuterReady = () => { outerReadyEvents++; };
+    cluster.on('ready', onOuterReady);
+    socket.options.port = 1;
+    socket.options.retryStrategy = () => 100;
+    try {
+      const disconnected = new Promise<void>(resolve => socket.once('close', resolve));
+      socket.connector!.stream!.destroy();
+      await disconnected;
+      await writer.set('missed', 91);
+      expect(reader.get('missed')).toBeUndefined();
+      await waitUntil(async () => reader.get('missed') === 91, 10000);
+      expect(internal.getInstance()).not.toBe(socket);
+      expect(outerReadyEvents).toBe(0);
+    } finally {
+      cluster.removeListener('ready', onOuterReady);
+      socket.options.port = oldPort;
+      socket.options.retryStrategy = oldRetryStrategy;
     }
   }, 18000);
 
