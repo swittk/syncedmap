@@ -37,7 +37,7 @@ export interface SyncedMapRedisClusterClient extends Omit<SyncedMapRedisClient, 
     startupNodes?: Array<string | number | { host?: string; port?: number }>,
     options?: { lazyConnect?: boolean }
   ): SyncedMapRedisClusterClient;
-  options: { redisOptions?: { keyPrefix?: string; db?: number }; scaleReads?: unknown };
+  options: { keyPrefix?: string; redisOptions?: { keyPrefix?: string; db?: number }; scaleReads?: unknown };
 }
 
 export type SyncedMapRedisConnection = SyncedMapRedisClient | SyncedMapRedisClusterClient;

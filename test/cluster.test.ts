@@ -216,6 +216,47 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     expect(await other.getFresh('missing')).toBeUndefined();
   }, 12000);
 
+  it('repairs missed messages after only the internal Cluster Pub/Sub socket reconnects', async () => {
+    const writer = openMap('cluster-subscriber-recovery');
+    const reader = openMap('cluster-subscriber-recovery');
+    await Promise.all([writer.ready(), reader.ready()]);
+    const cluster = (reader as unknown as { subscriber: Cluster }).subscriber;
+    const internal = (cluster as unknown as {
+      subscriber: {
+        getInstance(): { disconnect(): void };
+        selectSubscriber(): void;
+      };
+    }).subscriber;
+    expect(internal.getInstance()).toBeDefined();
+    let outerReadyEvents = 0;
+    const countReady = () => { outerReadyEvents++; };
+    cluster.on('ready', countReady);
+    try {
+      for (let i = 1; i <= 2; i++) {
+        const socket = internal.getInstance();
+        const originalSelect = internal.selectSubscriber.bind(internal);
+        let attemptedReconnect = false;
+        internal.selectSubscriber = () => { attemptedReconnect = true; };
+        try {
+          socket.disconnect();
+          await waitUntil(async () => attemptedReconnect);
+          // This write occurs while the actual subscription is absent.
+          await writer.set('missed-' + i, 30 + i);
+          expect(reader.get('missed-' + i)).toBeUndefined();
+        } finally {
+          internal.selectSubscriber = originalSelect;
+          originalSelect();
+        }
+        await waitUntil(async () => reader.get('missed-' + i) === 30 + i, 8000);
+      }
+      // Cluster's own ready event is not emitted for physical Pub/Sub
+      // replacement, so it cannot be the only resync trigger.
+      expect(outerReadyEvents).toBe(0);
+    } finally {
+      cluster.removeListener('ready', countReady);
+    }
+  }, 25000);
+
   it('shares one command-client error observer across many namespaces', async () => {
     const client = newClient();
     await client.ping();
@@ -228,6 +269,23 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     await Promise.all(mapsForClient.map(map => map.dispose()));
     expect(client.listenerCount('error')).toBe(baseline);
   }, 20000);
+
+  it('rejects both top-level and nested Cluster keyPrefix options', async () => {
+    for (const options of [
+      { keyPrefix: 'bad:', lazyConnect: true },
+      { redisOptions: { keyPrefix: 'bad:' }, lazyConnect: true },
+    ]) {
+      const client = new Cluster([{ host: '127.0.0.1', port: basePort }], options);
+      client.on('error', () => undefined);
+      clients.push(client);
+      const map = openMap('cluster-prefixed-key-rejection', client);
+      try {
+        await expect(map.ready()).rejects.toThrow(/keyPrefix/);
+      } finally {
+        await map.dispose();
+      }
+    }
+  }, 12000);
 
   it('rejects replica-read routing that would make authoritative reads stale', async () => {
     const client = new Cluster(
@@ -256,6 +314,81 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
       await otherPrimary.config('SET', 'maxmemory', '0');
     }
   }, 12000);
+
+  it('retries a scan that missed keys during a Cluster topology transition', async () => {
+    const client = newClient();
+    const writer = openMap('cluster-topology-retry', client);
+    await writer.ready();
+    await writer.set('must-survive', 43);
+
+    const readerClient = newClient();
+    const reader = openMap('cluster-topology-retry', readerClient);
+    await reader.ready();
+    expect(reader.get('must-survive')).toBe(43);
+
+    const raw = readerClient as unknown as { cluster(command: string): Promise<unknown> };
+    const originalTopology = raw.cluster.bind(readerClient);
+    let topologyCalls = 0;
+    raw.cluster = async command => {
+      const value = await originalTopology(command);
+      if (command === 'SLOTS' && ++topologyCalls === 2) return ['changed during scan'];
+      return value;
+    };
+    const primaries = readerClient.nodes('master');
+    const originalScans = primaries.map(node => node.scan.bind(node));
+    let scanCalls = 0;
+    for (let index = 0; index < primaries.length; index++) {
+      const node = primaries[index]!;
+      const scan = originalScans[index]!;
+      node.scan = ((...args: Parameters<typeof node.scan>) => {
+        scanCalls++;
+        // The first pass skipped the record, as a moving slot could.
+        if (topologyCalls < 2) return Promise.resolve(['0', []]);
+        return scan(...args);
+      }) as typeof node.scan;
+    }
+    const changes: string[] = [];
+    const stop = reader.subscribe(change => changes.push(change.type));
+    try {
+      await reader.resync();
+      expect(reader.get('must-survive')).toBe(43);
+      expect(scanCalls).toBeGreaterThan(primaries.length);
+      expect(changes).toEqual(['resync']);
+    } finally {
+      stop();
+      raw.cluster = originalTopology;
+      for (let index = 0; index < primaries.length; index++) {
+        primaries[index]!.scan = originalScans[index]! as typeof primaries[number]['scan'];
+      }
+    }
+  }, 15000);
+
+  it('rejects perpetually unstable topology without replacing a good replica', async () => {
+    const client = newClient();
+    const reader = openMap('cluster-topology-unstable', client);
+    await reader.ready();
+    await reader.set('preserve', 81);
+
+    const raw = client as unknown as { cluster(command: string): Promise<unknown> };
+    const original = raw.cluster.bind(client);
+    let generation = 0;
+    raw.cluster = async command =>
+      command === 'SLOTS' ? { generation: ++generation } : original(command);
+
+    const notifications: string[] = [];
+    const stop = reader.subscribe(change => notifications.push(change.type));
+    try {
+      await expect(reader.resync()).rejects.toThrow(/topology changed repeatedly/);
+      expect(reader.get('preserve')).toBe(81);
+      expect(notifications).toEqual([]);
+      expect(generation).toBeGreaterThanOrEqual(6);
+    } finally {
+      stop();
+      raw.cluster = original;
+    }
+    await reader.resync();
+    expect(reader.get('preserve')).toBe(81);
+  }, 15000);
 
   it('replays live updates arriving during the final topology check', async () => {
     const writer = openMap('cluster-topology-replay');

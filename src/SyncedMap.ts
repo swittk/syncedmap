@@ -29,6 +29,25 @@ function isClusterClient(client: SyncedMapRedisConnection): client is SyncedMapR
   return 'isCluster' in client && client.isCluster === true && typeof client.nodes === 'function';
 }
 
+// ioredis Cluster emits no top-level 'ready' when its *internal* Pub/Sub
+// socket is replaced. Observe that physical socket's 'end' instead.
+// ClusterSubscriber.getInstance() is present in the supported ioredis 5.x
+// implementations; fail initialization rather than silently lose recovery.
+type ClusterSubscriptionSocket = {
+  on(event: 'end', listener: () => void): unknown;
+  removeListener(event: 'end', listener: () => void): unknown;
+};
+
+function getClusterSubscriptionSocket(client: SyncedMapRedisClusterClient): ClusterSubscriptionSocket | null {
+  const internal = client as unknown as {
+    subscriber?: { getInstance?: () => ClusterSubscriptionSocket | null };
+  };
+  if (typeof internal.subscriber?.getInstance !== 'function') {
+    throw new Error('Unsupported ioredis Cluster Pub/Sub implementation: cannot observe subscriber recovery.');
+  }
+  return internal.subscriber.getInstance();
+}
+
 // A supplied Redis/Cluster client can be shared by many maps. Keep one
 // EventEmitter listener per connection instead of hitting Node's 10-listener
 // warning and repeating the event-handler overhead for every namespace.
@@ -119,6 +138,15 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private resyncTimer?: ReturnType<typeof setInterval>;
   private disposeJob?: Promise<void>;
   private stopObservingCommandErrors?: () => void;
+  private observedClusterSubscriptionSocket?: ClusterSubscriptionSocket;
+  private clusterRecoveryJob?: Promise<void>;
+  private clusterRecoveryNeeded = false;
+  private readonly onClusterSubscriptionEnd = () => {
+    if (this.disposed || !this.redisSubscribed) return;
+    // ioredis replaces the physical socket on 'end', without emitting
+    // 'ready' on the enclosing Cluster. Defer until its selector has run.
+    void Promise.resolve().then(() => this.requestClusterRecovery()).catch(error => this.reportError(error));
+  };
   private cancelInitialization: () => void = () => undefined;
   private readonly initializationStopped = new Promise<void>(resolve => {
     this.cancelInitialization = resolve;
@@ -182,6 +210,54 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (this.ownsRedis) this.redis?.disconnect();
   }
 
+  /** Follow the physical Pub/Sub connection used by ioredis Cluster. */
+  private watchClusterSubscriptionSocket(): void {
+    const subscriber = this.subscriber;
+    if (!subscriber || !isClusterClient(subscriber)) return;
+    const socket = getClusterSubscriptionSocket(subscriber);
+    if (!socket || socket === this.observedClusterSubscriptionSocket) return;
+    this.observedClusterSubscriptionSocket?.removeListener('end', this.onClusterSubscriptionEnd);
+    this.observedClusterSubscriptionSocket = socket;
+    socket.on('end', this.onClusterSubscriptionEnd);
+  }
+
+  /** Repair messages lost while the Cluster's own subscriber reconnects. */
+  private requestClusterRecovery(): void {
+    if (this.disposed || !this.redisSubscribed) return;
+    this.clusterRecoveryNeeded = true;
+    if (this.clusterRecoveryJob) return;
+    const repair = async () => {
+      while (this.clusterRecoveryNeeded && !this.disposed) {
+        this.clusterRecoveryNeeded = false;
+        this.watchClusterSubscriptionSocket();
+        try {
+          // performResync first re-subscribes, then reads authoritative state.
+          await this.runResync();
+          this.watchClusterSubscriptionSocket();
+        } catch (error) {
+          if (this.disposed) break;
+          this.reportError(error);
+          this.clusterRecoveryNeeded = true;
+          // Retry only after a real subscription outage, not on the normal
+          // read/write path or when periodic reconciliation is disabled.
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 500);
+            timer.unref?.();
+          });
+        }
+      }
+    };
+    const job = repair();
+    this.clusterRecoveryJob = job;
+    void job.then(
+      () => { if (this.clusterRecoveryJob === job) this.clusterRecoveryJob = undefined; },
+      error => {
+        if (this.clusterRecoveryJob === job) this.clusterRecoveryJob = undefined;
+        if (!this.disposed) this.reportError(error);
+      }
+    );
+  }
+
   /** Break unresponsive subscriber/command promises when disposal begins. */
   private async duringInitialization<Result>(operation: Promise<Result>): Promise<Result> {
     const monitored = operation.then(
@@ -213,7 +289,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       // Refuse a configuration which would silently corrupt hydration/clear.
       const client = config.client;
       const keyPrefix = isClusterClient(client)
-        ? client.options?.redisOptions?.keyPrefix
+        ? client.options?.keyPrefix || client.options?.redisOptions?.keyPrefix
         : client.options?.keyPrefix;
       if (keyPrefix) {
         throw new TypeError('SyncedMap does not support a Redis client with keyPrefix.');
@@ -302,6 +378,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     });
     subscriber.on('ready', () => {
       if (this.redisSubscribed && !this.disposed) {
+        if (cluster) this.watchClusterSubscriptionSocket();
         void this.runResync().catch(error => this.reportError(error));
       }
     });
@@ -310,6 +387,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     await this.duringInitialization(subscriber.subscribe(this.eventChannel));
     if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
     this.redisSubscribed = true;
+    if (cluster) this.watchClusterSubscriptionSocket();
     await this.duringInitialization(this.runResync());
     if (this.disposed) throw new Error('SyncedMap was disposed during initialization.');
     this.readyFlag = true;
@@ -483,6 +561,37 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
   }
 
+  /** Build one full snapshot; never install it before checking Cluster topology. */
+  private async readRedisSnapshot(
+    redis: SyncedMapRedisConnection
+  ): Promise<{ values: Map<Key, StoredRecord<Value>>; versions: Map<Key, number> }> {
+    const values = new Map<Key, StoredRecord<Value>>();
+    const versions = new Map<Key, number>();
+    for await (const keys of this.scanEntryKeys()) {
+      const batches: string[][] = [];
+      for (let offset = 0; offset < keys.length; offset += redisReadBatchSize) {
+        batches.push(keys.slice(offset, offset + redisReadBatchSize));
+      }
+      // SCAN cursors are sequential, but MGET batches within a page can
+      // run concurrently. Promise.all retains the batch ordering.
+      const results = await Promise.all(batches.map(batch => redis.mget(...batch)));
+      for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        const batch = batches[batchIndex]!;
+        const rawValues = results[batchIndex]!;
+        for (let i = 0; i < batch.length; i++) {
+          const redisKey = batch[i];
+          const raw = rawValues[i];
+          if (!redisKey || !raw) continue; // Key might have expired during SCAN.
+          const key = decodeURIComponent(redisKey.slice(this.entryPrefix.length)) as Key;
+          const entry = parseRecord<Value>(raw);
+          values.set(key, { ...entry, value: freezeValue(entry.value) });
+          versions.set(key, entry.version);
+        }
+      }
+    }
+    return { values, versions };
+  }
+
   /** Reconstruct state from Redis; pub/sub events arriving during SCAN are replayed. */
   private async performResync(periodic = false): Promise<void> {
     const redis = this.redis;
@@ -508,53 +617,42 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.bufferedEvents = new Map();
     try {
       await subscriber.subscribe(this.eventChannel);
-      const baselineRaw = await redis.get(this.revisionKey);
-      const baseline = Number(baselineRaw ?? '0');
-      if (!Number.isSafeInteger(baseline) || baseline < 0) {
-        throw new Error('Invalid SyncedMap revision counter.');
-      }
-      const values = new Map<Key, StoredRecord<Value>>();
-      const versions = new Map<Key, number>();
-      for await (const keys of this.scanEntryKeys()) {
-        const batches: string[][] = [];
-        for (let offset = 0; offset < keys.length; offset += redisReadBatchSize) {
-          batches.push(keys.slice(offset, offset + redisReadBatchSize));
+      // Redis Cluster can move a namespace between primaries while SCAN
+      // walks them. An unstable scan is incomplete, even if no write changed
+      // the revision counter. Retry against a fresh topology and baseline;
+      // never replace a good replica with a known-incomplete snapshot.
+      for (let attempt = 0; attempt < (cluster ? 3 : 1); attempt++) {
+        const scanTopology = attempt === 0
+          ? topology
+          : JSON.stringify(await cluster!.cluster('SLOTS'));
+        const baselineRaw = await redis.get(this.revisionKey);
+        const baseline = Number(baselineRaw ?? '0');
+        if (!Number.isSafeInteger(baseline) || baseline < 0) {
+          throw new Error('Invalid SyncedMap revision counter.');
         }
-        // SCAN cursors are sequential, but MGET batches within a page can
-        // run concurrently. Promise.all retains the batch ordering.
-        const results = await Promise.all(batches.map(batch => redis.mget(...batch)));
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-          const batch = batches[batchIndex]!;
-          const rawValues = results[batchIndex]!;
-          for (let i = 0; i < batch.length; i++) {
-            const redisKey = batch[i];
-            const raw = rawValues[i];
-            if (!redisKey || !raw) continue; // Key might have expired during SCAN.
-            const key = decodeURIComponent(redisKey.slice(this.entryPrefix.length)) as Key;
-            const entry = parseRecord<Value>(raw);
-            values.set(key, { ...entry, value: freezeValue(entry.value) });
-            versions.set(key, entry.version);
-          }
+        const { values, versions } = await this.readRedisSnapshot(redis);
+        // No awaits between taking pending events and replaying them.
+        const afterTopology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
+        if (scanTopology !== afterTopology) {
+          if (attempt < 2) continue;
+          throw new Error('Redis Cluster topology changed repeatedly during SyncedMap reconciliation.');
         }
+        if (this.disposed) throw new Error('SyncedMap disposed during reconciliation.');
+        const pending = this.bufferedEvents;
+        this.entriesByKey = values;
+        this.versionsByKey = versions;
+        this.baselineRevision = baseline;
+        this.expiryQueue.replace(values);
+        this.lastHydrationRevision = baseline;
+        this.lastHydrationTopology = afterTopology;
+        this.bufferedEvents = new Map();
+        this.buffering = false;
+        // These mutations already reached live observers. Replay silently
+        // and emit one resync only after a stable scan succeeded.
+        for (const event of pending.values()) this.applyEvent(event, false);
+        this.emit({ type: 'resync' });
+        return;
       }
-      // Resharding or failover can move entries without incrementing the
-      // revision. Check topology BEFORE the synchronous swap-and-replay: an
-      // await between taking pending events and replaying them drops updates.
-      const afterTopology = cluster ? JSON.stringify(await cluster.cluster('SLOTS')) : undefined;
-      if (this.disposed) throw new Error('SyncedMap disposed during reconciliation.');
-      const pending = this.bufferedEvents;
-      this.entriesByKey = values;
-      this.versionsByKey = versions;
-      this.baselineRevision = baseline;
-      this.expiryQueue.replace(values);
-      this.lastHydrationRevision = baseline;
-      this.lastHydrationTopology = topology === afterTopology ? topology : undefined;
-      this.bufferedEvents = new Map();
-      this.buffering = false;
-      // These mutations were already delivered to live subscribers. Replay
-      // only the newest state per key, then emit one resync notification.
-      for (const event of pending.values()) this.applyEvent(event, false);
-      this.emit({ type: 'resync' });
     } catch (error) {
       // Failed hydration never swaps the snapshot: live events have already
       // been applied and notified, so replaying would only duplicate them.
@@ -817,6 +915,9 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.readyFlag = false;
     this.cancelInitialization();
     if (this.resyncTimer) clearInterval(this.resyncTimer);
+    this.clusterRecoveryNeeded = false;
+    this.observedClusterSubscriptionSocket?.removeListener('end', this.onClusterSubscriptionEnd);
+    this.observedClusterSubscriptionSocket = undefined;
     this.expiryQueue.dispose();
     this.listeners.clear();
     // Unblock connection/subscription attempts that are still initializing.

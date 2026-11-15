@@ -74,7 +74,11 @@ namespaces can land on different Cluster primaries. Full reconciliation and
 clear scan **every Cluster primary** because Redis SCAN is node-local; MGET,
 reads, and writes are routed through the Cluster client. Periodic reconciliation
 also checks slot topology: a reshard or failover forces a full scan even if
-the revision counter appears unchanged.
+the revision counter appears unchanged. If topology changes *during* a full
+scan, SyncedMap retries instead of installing a potentially incomplete
+snapshot and rejects persistently unstable scans. Reconnection of the internal
+Cluster Pub/Sub socket also triggers a full repair, even with
+`resyncIntervalMs: 0`.
 
 Redis Cluster uses only database 0. Configure the Cluster client with
 \`scaleReads: 'master'\` (or leave it at the default); replica-read routing
