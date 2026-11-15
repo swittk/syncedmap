@@ -41,7 +41,10 @@ type ClusterSubscriptionSocket = {
 
 function getClusterSubscriptionSocket(client: SyncedMapRedisClusterClient): ClusterSubscriptionSocket | null {
   const internal = client as unknown as {
-    subscriber?: { getInstance?: () => ClusterSubscriptionSocket | null };
+    subscriber?: {
+      getInstance?: () => ClusterSubscriptionSocket | null;
+      selectSubscriber?: () => void;
+    };
   };
   if (typeof internal.subscriber?.getInstance !== 'function') {
     throw new Error('Unsupported ioredis Cluster Pub/Sub implementation: cannot observe subscriber recovery.');
@@ -143,7 +146,10 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private clusterRecoveryJob?: Promise<void>;
   private clusterRecoveryNeeded = false;
   private readonly onClusterSubscriptionClose = () => {
-    if (!this.disposed && this.redisSubscribed) this.clusterRecoveryNeeded = true;
+    // ioredis 5.0 keeps retrying this same socket indefinitely, even when
+    // the rest of the Cluster can serve commands. Start recovery on close,
+    // not only on a later ready/end that might never arrive.
+    if (!this.disposed && this.redisSubscribed) this.requestClusterRecovery();
   };
   private readonly onClusterSubscriptionReady = () => {
     if (!this.disposed && this.clusterRecoveryNeeded) this.requestClusterRecovery();
@@ -244,18 +250,56 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.observedClusterSubscriptionSocket = undefined;
   }
 
+  /** Move a stuck ioredis 5.x Pub/Sub socket to a currently reachable node.
+   * Refresh the connection pool before invoking its existing selector so
+   * a permanently dead node is not chosen from a stale inventory.
+   */
+  private async restartStalledClusterSubscription(): Promise<void> {
+    const subscriber = this.subscriber;
+    if (!subscriber || !isClusterClient(subscriber) || this.disposed) return;
+    await new Promise<void>((resolve, reject) =>
+      subscriber.refreshSlotsCache(error => error ? reject(error) : resolve())
+    );
+    if (this.disposed || this.observedClusterSubscriptionSocket?.status === 'ready') return;
+    const internal = subscriber as unknown as {
+      subscriber?: { selectSubscriber?: () => void };
+    };
+    if (typeof internal.subscriber?.selectSubscriber !== 'function') {
+      throw new Error('Unsupported ioredis Cluster Pub/Sub implementation: cannot switch subscriber node.');
+    }
+    internal.subscriber.selectSubscriber();
+    this.watchClusterSubscriptionSocket();
+    // The new ioredis physical socket is lazy. If the old endpoint never
+    // returns, its subscription replay may not start this replacement.
+    // Explicitly subscribe so the new socket can become ready; keep the
+    // reconnect loop free to rotate again if this endpoint also fails.
+    void subscriber.subscribe(this.eventChannel).catch(error => {
+      if (!this.disposed) this.reportError(error);
+    });
+  }
+
   /** Repair messages lost while the Cluster's own subscriber reconnects. */
   private requestClusterRecovery(): void {
     if (this.disposed || !this.redisSubscribed) return;
     this.clusterRecoveryNeeded = true;
     if (this.clusterRecoveryJob) return;
     const repair = async () => {
+      let nextFallbackAt = Date.now() + 1500;
       while (this.clusterRecoveryNeeded && !this.disposed) {
         this.watchClusterSubscriptionSocket();
         // The old Pub/Sub connection may have ended before ioredis could
-        // select a replacement. Wait until the physical socket is ready
-        // before resubscribing, even if replacement is delayed.
+        // select a replacement. Older ioredis can instead retry one dead
+        // endpoint forever. Rotate it if it is still stuck after a grace
+        // period, without requiring the caller to enable periodic scans.
         if (this.observedClusterSubscriptionSocket?.status !== 'ready') {
+          if (Date.now() >= nextFallbackAt) {
+            nextFallbackAt = Date.now() + 1500;
+            try {
+              await this.restartStalledClusterSubscription();
+            } catch (error) {
+              if (!this.disposed) this.reportError(error);
+            }
+          }
           await new Promise<void>(resolve => {
             const timer = setTimeout(resolve, 200);
             timer.unref?.();
@@ -596,6 +640,12 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
    * Only stable placement is safe for scans that visit primaries in order.
    */
   private async readClusterTopology(cluster: SyncedMapRedisClusterClient): Promise<string> {
+    // CLUSTER SLOTS alone does NOT update ioredis's node inventory. Refresh
+    // the connection pool before taking a snapshot or collecting clear targets.
+    // This also works when the caller disables periodic slot refreshes.
+    await new Promise<void>((resolve, reject) =>
+      cluster.refreshSlotsCache(error => error ? reject(error) : resolve())
+    );
     const masters = cluster.nodes('master');
     if (masters.length === 0) throw new Error('No Redis Cluster primary nodes available.');
     const [slots, nodeStates] = await Promise.all([

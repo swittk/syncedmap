@@ -32,6 +32,8 @@ export interface SyncedMapRedisClusterClient extends Omit<SyncedMapRedisClient, 
   readonly isCluster: boolean;
   ping(): Promise<string>;
   cluster(command: 'SLOTS'): Promise<unknown>;
+  /** Updates ioredis routing and node connections before a Cluster-wide SCAN. */
+  refreshSlotsCache(callback?: (error?: Error | null) => void): void;
   nodes(role: 'master' | 'all'): SyncedMapRedisClient[];
   duplicate(
     startupNodes?: Array<string | number | { host?: string; port?: number }>,

@@ -72,7 +72,9 @@ Each namespace uses a Redis hash tag, so its records and revision counter
 reside in one slot and its multi-key Lua writes remain atomic. Different
 namespaces can land on different Cluster primaries. Full reconciliation and
 clear scan **every Cluster primary** because Redis SCAN is node-local; MGET,
-reads, and writes are routed through the Cluster client. Periodic reconciliation
+reads, and writes are routed through the Cluster client. Before scanning,
+SyncedMap explicitly refreshes ioredis's cached primary inventory (including
+when its automatic slot refresh is disabled). Periodic reconciliation
 also checks slot topology: a reshard or failover forces a full scan even if
 the revision counter appears unchanged. If topology changes *during* a full
 scan, SyncedMap retries instead of installing a potentially incomplete
@@ -83,7 +85,9 @@ otherwise Redis could omit keys even when CLUSTER SLOTS looks unchanged.
 
 Reconnection of the internal Cluster Pub/Sub socket triggers a full repair,
 including automatic same-socket reconnection in older ioredis 5.x, even with
-`resyncIntervalMs: 0`.
+`resyncIntervalMs: 0`. If the socket keeps retrying a permanently unreachable
+endpoint, SyncedMap refreshes the Cluster's node inventory and moves its owned
+subscriber to another node before rehydrating.
 
 Redis Cluster uses only database 0. Configure the Cluster client with
 \`scaleReads: 'master'\` (or leave it at the default); replica-read routing

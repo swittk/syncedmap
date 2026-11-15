@@ -303,6 +303,47 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     }
   }, 15000);
 
+  it('moves Pub/Sub off a permanently unavailable retry endpoint', async () => {
+    const writer = openMap('cluster-stranded-subscriber');
+    const reader = openMap('cluster-stranded-subscriber');
+    await Promise.all([writer.ready(), reader.ready()]);
+    const cluster = (reader as unknown as { subscriber: Cluster }).subscriber;
+    const internal = (cluster as unknown as {
+      subscriber: {
+        getInstance(): {
+          options: { port: number; retryStrategy?: (times: number) => number | null };
+          connector?: { stream?: { destroy(): void } };
+          once(event: 'close', callback: () => void): void;
+        };
+      };
+    }).subscriber;
+    const strandedSocket = internal.getInstance();
+    const originalPort = strandedSocket.options.port;
+    const originalRetry = strandedSocket.options.retryStrategy;
+    expect(strandedSocket.connector?.stream).toBeDefined();
+    // This particular Pub/Sub endpoint is unreachable on every retry.
+    // The rest of the Redis Cluster remains fully healthy.
+    strandedSocket.options.port = 1;
+    strandedSocket.options.retryStrategy = () => 100;
+    const close = new Promise<void>(resolve => strandedSocket.once('close', resolve));
+    let outerReady = 0;
+    const onOuterReady = () => { outerReady++; };
+    cluster.on('ready', onOuterReady);
+    try {
+      strandedSocket.connector!.stream!.destroy();
+      await close;
+      await writer.set('missed', 91);
+      expect(reader.get('missed')).toBeUndefined();
+      await waitUntil(async () => reader.get('missed') === 91, 10000);
+      expect(internal.getInstance()).not.toBe(strandedSocket);
+      expect(outerReady).toBe(0);
+    } finally {
+      cluster.removeListener('ready', onOuterReady);
+      strandedSocket.options.retryStrategy = originalRetry;
+      strandedSocket.options.port = originalPort;
+    }
+  }, 18000);
+
   it('shares one command-client error observer across many namespaces', async () => {
     const client = newClient();
     await client.ping();
@@ -452,6 +493,53 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
       raw.cluster = original;
     }
   }, 15000);
+
+  it('refreshes the Cluster primary inventory before clear with automatic slot refresh disabled', async () => {
+    const client = new Cluster(
+      [{ host: '127.0.0.1', port: basePort }],
+      { slotsRefreshInterval: 0 }
+    );
+    client.on('error', () => undefined);
+    clients.push(client);
+    const namespace = 'cluster-inventory-clear';
+    const map = openMap(namespace, client);
+    await map.ready();
+    await map.set('required', 123);
+    const originalNodes = client.nodes.bind(client);
+    const slot = Number(await client.cluster('KEYSLOT', 'syncedmap:{cluster-inventory-clear}:entry:required'));
+    const owner = client.slots[slot]?.[0];
+    expect(owner).toBeDefined();
+    const ownerPort = Number(owner!.split(':').at(-1));
+    const omittedPrimary = originalNodes('master').find(node => node.options.port === ownerPort);
+    expect(omittedPrimary).toBeDefined();
+    const originalRefresh = client.refreshSlotsCache.bind(client);
+    let refreshed = false;
+    let refreshCalls = 0;
+    // Simulate a caller with an obsolete pool lacking the master that owns
+    // our namespace. A plain CLUSTER SLOTS command does not refresh that pool.
+    client.nodes = ((role: 'all' | 'master' | 'slave' = 'all') => {
+      const nodes = originalNodes(role);
+      if (!refreshed && role === 'master') {
+        return nodes.filter(node => node !== omittedPrimary);
+      }
+      return nodes;
+    }) as typeof client.nodes;
+    client.refreshSlotsCache = ((callback?: (error?: Error | null) => void) => {
+      refreshCalls++;
+      originalRefresh(error => {
+        if (!error) refreshed = true;
+        callback?.(error);
+      });
+    }) as typeof client.refreshSlotsCache;
+    try {
+      await map.clear();
+      expect(refreshCalls).toBeGreaterThanOrEqual(2);
+      expect(await map.getFresh('required')).toBeUndefined();
+    } finally {
+      client.nodes = originalNodes as typeof client.nodes;
+      client.refreshSlotsCache = originalRefresh as typeof client.refreshSlotsCache;
+    }
+  }, 20000);
 
   it('retries a scan that missed keys during a Cluster topology transition', async () => {
     const client = newClient();
