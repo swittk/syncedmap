@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import loadOptionalRedis from './redisLoader.cjs';
-import { LocalExpiryQueue } from './localExpiryQueue.js';
+import { ExpiryQueue } from './expiryQueue.js';
 import { UniqueMutexManager } from 'uniquemutexmanager';
 import { READ_SCRIPT, WRITE_SCRIPT, encodeRecord, freezeValue, parseRecord, serializeJson } from './redisProtocol.js';
 import type { StoredRecord } from './redisProtocol.js';
@@ -23,6 +23,10 @@ type CurrentState<Value> = {
 };
 
 type WriteAction = 'set' | 'delete';
+
+/** Redis cursor pages are larger than transport value batches. */
+const redisScanCount = 1000;
+const redisReadBatchSize = 200;
 
 function positiveTtl(ttlMs: number | undefined): number {
   // Zero explicitly disables a default TTL for one write.
@@ -54,9 +58,12 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   private eventChannel: string;
   private readonly defaultTtlMs: number;
   private readonly errorHandler?: (error: Error) => void;
+  /** Background scans can be skipped on a fully unchanged, non-evictable replica. */
+  private lastHydrationRevision?: number;
+  private canSkipUnchangedResync = false;
   private readonly listeners = new Set<(change: SyncedMapChange<Key, Value>) => void>();
-  /** Local mode needs expiry cleanup even when nobody calls get() or iterates. */
-  private readonly localExpiryQueue?: LocalExpiryQueue<Key>;
+  /** Both local and Redis replicas expire cached entries without a full scan. */
+  private readonly expiryQueue: ExpiryQueue<Key>;
 
   private mutex: UniqueMutexManager;
   private redis?: SyncedMapRedisClient;
@@ -96,16 +103,17 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.revisionKey = this.redisPrefix + ':revision';
     this.eventChannel = this.redisPrefix + ':events';
     this.mutex = new UniqueMutexManager({ namespace: this.redisPrefix });
+    this.expiryQueue = new ExpiryQueue((key, expiresAt) => {
+      const entry = this.entriesByKey.get(key);
+      // A newer write can replace this key before the expiration callback.
+      if (entry && entry.expiresAt === expiresAt && expiresAt <= Date.now()) {
+        this.entriesByKey.delete(key);
+        // Redis-backed replicas must preserve revisions against late events.
+        if (!this.redis) this.versionsByKey.delete(key);
+      }
+    });
 
     if (!options.redis) {
-      this.localExpiryQueue = new LocalExpiryQueue((key, expiresAt) => {
-        const entry = this.entriesByKey.get(key);
-        // A newer write can replace this key before the expiration callback.
-        if (entry && entry.expiresAt === expiresAt && expiresAt <= Date.now()) {
-          this.entriesByKey.delete(key);
-          this.versionsByKey.delete(key);
-        }
-      });
       this.readyFlag = true;
       this.initialization = Promise.resolve();
     } else {
@@ -190,6 +198,10 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (Number(maxmemory) > 0 && policy.startsWith('allkeys-')) {
       throw new Error('SyncedMap requires a noeviction or volatile-* Redis maxmemory-policy when maxmemory is enabled.');
     }
+    // Without memory-pressure eviction, only writes can change non-TTL keys;
+    // absolute TTLs are already tracked locally. Under volatile-* eviction,
+    // an early entry loss may have no revision change, so full scans remain.
+    this.canSkipUnchangedResync = Number(maxmemory) === 0 || policy === 'noeviction';
     // Redis Pub/Sub is shared across SELECTed databases. Scope the channel to
     // the client's configured database, just as Redis scopes stored keys.
     const database = redis.options?.db;
@@ -245,7 +257,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
     if (intervalMs > 0) {
       this.resyncTimer = setInterval(() => {
-        if (!this.disposed) void this.runResync().catch(error => this.reportError(error));
+        if (!this.disposed) void this.runResync(true).catch(error => this.reportError(error));
       }, intervalMs);
       this.resyncTimer.unref?.();
     }
@@ -281,10 +293,10 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.assertKey(key);
     const entry = this.entriesByKey.get(key);
     const value = this.currentValue(entry);
-    if (value === undefined && entry && !this.redis) {
+    if (value === undefined && entry) {
       this.entriesByKey.delete(key);
-      this.versionsByKey.delete(key);
-      this.localExpiryQueue?.delete(key);
+      if (!this.redis) this.versionsByKey.delete(key);
+      this.expiryQueue.delete(key);
     }
     return value;
   }
@@ -295,15 +307,13 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
 
   get size(): number {
     this.assertReady();
-    let size = 0;
-    for (const entry of this.entriesByKey.values()) {
-      if (this.currentValue(entry) !== undefined) size++;
-    }
-    return size;
+    this.expiryQueue.expireDue();
+    return this.entriesByKey.size;
   }
 
   *entries(): IterableIterator<[Key, Value]> {
     this.assertReady();
+    this.expiryQueue.expireDue();
     for (const [key, entry] of this.entriesByKey) {
       const value = this.currentValue(entry);
       if (value !== undefined) yield [key, value];
@@ -366,7 +376,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       entry.value = freezeValue(entry.value);
       this.entriesByKey.set(event.key, entry);
       this.versionsByKey.set(event.key, event.revision);
-      if (!this.redis) this.localExpiryQueue?.set(event.key, entry.expiresAt);
+      this.expiryQueue.set(event.key, entry.expiresAt);
       if (notify) {
         this.emit({
           type: 'set', key: event.key, value: entry.value, revision: event.revision,
@@ -376,7 +386,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     } else {
       const existed = this.entriesByKey.has(event.key);
       this.entriesByKey.delete(event.key);
-      if (!this.redis) this.localExpiryQueue?.delete(event.key);
+      this.expiryQueue.delete(event.key);
       // Local mode has no delayed remote events: retaining tombstones would
       // leak one Map entry per deleted key indefinitely.
       if (this.redis) this.versionsByKey.set(event.key, event.revision);
@@ -391,10 +401,22 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
   }
 
   /** Reconstruct state from Redis; pub/sub events arriving during SCAN are replayed. */
-  private async performResync(): Promise<void> {
+  private async performResync(periodic = false): Promise<void> {
     const redis = this.redis;
     const subscriber = this.subscriber;
     if (!redis || !subscriber || this.disposed) return;
+
+    // A periodic check can avoid a full SCAN when this namespace has seen
+    // no writes and Redis cannot silently evict entries. Expiry itself is
+    // already maintained by the local heap. Explicit/reconnect resyncs always
+    // rehydrate, and volatile-* eviction policies must always do a full scan.
+    const tooManyTombstones = this.versionsByKey.size > this.entriesByKey.size + 512;
+    if (periodic && this.canSkipUnchangedResync &&
+        this.lastHydrationRevision !== undefined && !tooManyTombstones) {
+      const revision = await redis.get(this.revisionKey);
+      if ((revision ?? '0') === String(this.lastHydrationRevision)) return;
+    }
+
     this.buffering = true;
     this.bufferedEvents = new Map();
     try {
@@ -408,11 +430,20 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       const versions = new Map<Key, number>();
       let cursor = '0';
       do {
-        const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', 200);
+        const [nextCursor, keys] = await redis.scan(
+          cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', redisScanCount
+        );
         cursor = nextCursor;
-        for (let offset = 0; offset < keys.length; offset += 200) {
-          const batch = keys.slice(offset, offset + 200);
-          const rawValues = await redis.mget(...batch);
+        const batches: string[][] = [];
+        for (let offset = 0; offset < keys.length; offset += redisReadBatchSize) {
+          batches.push(keys.slice(offset, offset + redisReadBatchSize));
+        }
+        // SCAN cursors are sequential, but MGET batches within a page can
+        // run concurrently. Promise.all retains the batch ordering.
+        const results = await Promise.all(batches.map(batch => redis.mget(...batch)));
+        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+          const batch = batches[batchIndex]!;
+          const rawValues = results[batchIndex]!;
           for (let i = 0; i < batch.length; i++) {
             const redisKey = batch[i];
             const raw = rawValues[i];
@@ -431,6 +462,8 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
       this.entriesByKey = values;
       this.versionsByKey = versions;
       this.baselineRevision = baseline;
+      this.expiryQueue.replace(values);
+      this.lastHydrationRevision = baseline;
       this.bufferedEvents = new Map();
       this.buffering = false;
       // These mutations were already delivered to live subscribers. Replay
@@ -446,16 +479,19 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     }
   }
 
-  private runResync(): Promise<void> {
+  private runResync(periodic = false): Promise<void> {
     if (this.resyncJob) {
-      this.resyncAgain = true;
+      // Periodic maintenance must not request a redundant second full scan
+      // while a reconciliation is already running.
+      if (!periodic) this.resyncAgain = true;
       return this.resyncJob;
     }
     const run = async () => {
+      let checkOnly = periodic;
       do {
         this.resyncAgain = false;
         try {
-          await this.performResync();
+          await this.performResync(checkOnly);
         } catch (error) {
           // A reconnect that arrived during a failed scan still needs its
           // separately requested reconciliation. Without that request, fail
@@ -463,6 +499,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
           if (!this.resyncAgain || this.disposed) throw error;
           this.reportError(error);
         }
+        checkOnly = false;
       } while (this.resyncAgain && !this.disposed);
     };
     const job = run();
@@ -653,22 +690,44 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
    */
   async clear(): Promise<void> {
     await this.ready();
+    const targets = new Set<Key>();
     if (this.redis) {
-      // Complete SCAN before deleting: changing the keyspace mid-iteration
-      // can otherwise cause Redis SCAN to miss keys even without other writers.
-      const targets = new Set<Key>();
+      // Collect before deleting: mutating the keyspace while scanning can
+      // skip keys. Keep deletion concurrency bounded to avoid Redis overload.
       let cursor = '0';
       do {
-        const [next, keys] = await this.redis.scan(cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', 200);
+        const [next, keys] = await this.redis.scan(
+          cursor, 'MATCH', this.entryPrefix + '*', 'COUNT', redisScanCount
+        );
         cursor = next;
         for (const fullKey of keys) {
           targets.add(decodeURIComponent(fullKey.slice(this.entryPrefix.length)) as Key);
         }
       } while (cursor !== '0');
-      for (const key of targets) await this.delete(key);
     } else {
-      for (const key of [...this.entriesByKey.keys()]) await this.delete(key);
+      for (const key of this.entriesByKey.keys()) targets.add(key);
     }
+
+    const iterator = targets.values();
+    let failed = false;
+    let failure: unknown;
+    // Every worker retains per-key UMM locking and Redis CAS semantics.
+    // Stop assigning new keys on error, and drain all in-flight workers
+    // before rejecting so no deletions continue after clear() returns.
+    const workers = Array.from({ length: Math.min(32, targets.size) }, async () => {
+      while (!failed) {
+        const next = iterator.next();
+        if (next.done) return;
+        try {
+          await this.delete(next.value);
+        } catch (error) {
+          if (!failed) failure = error;
+          failed = true;
+        }
+      }
+    });
+    await Promise.all(workers);
+    if (failed) throw failure;
   }
 
   /** Dispose only Redis connections created by this map; never close a supplied Redis client. */
@@ -678,7 +737,7 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     this.readyFlag = false;
     this.cancelInitialization();
     if (this.resyncTimer) clearInterval(this.resyncTimer);
-    this.localExpiryQueue?.dispose();
+    this.expiryQueue.dispose();
     this.listeners.clear();
     // Unblock connection/subscription attempts that are still initializing.
     this.closeOwnedConnections();

@@ -640,6 +640,239 @@ describe('real Redis replication', () => {
     }
   }, 16000);
 
+  it('clears many keys with bounded concurrent writers and preserves locking', async () => {
+    const map = openMap('parallel-clear');
+    await map.ready();
+    for (let i = 0; i < 130; i++) await map.set('key-' + i, i);
+
+    const originalDelete = map.delete.bind(map);
+    let inFlight = 0;
+    let peakInFlight = 0;
+    map.delete = (async (key: string) => {
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      try {
+        await sleep(6);
+        return await originalDelete(key);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof map.delete;
+    try {
+      await map.clear();
+      expect(inFlight).toBe(0);
+      expect(peakInFlight).toBeGreaterThan(1);
+      expect(peakInFlight).toBeLessThanOrEqual(32);
+      expect(map.size).toBe(0);
+      await map.resync();
+      expect(map.size).toBe(0);
+    } finally {
+      map.delete = originalDelete as typeof map.delete;
+    }
+  }, 12000);
+
+  it('does not return from a failed clear while other deletions still run', async () => {
+    const map = openMap('parallel-clear-error');
+    await map.ready();
+    for (let i = 0; i < 80; i++) await map.set('item-' + i, i);
+    const originalDelete = map.delete.bind(map);
+    let inFlight = 0;
+    map.delete = (async (key: string) => {
+      inFlight++;
+      try {
+        await sleep(8);
+        if (key === 'item-0') throw new Error('Injected deletion failure');
+        return await originalDelete(key);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof map.delete;
+    try {
+      await expect(map.clear()).rejects.toThrow('Injected deletion failure');
+      expect(inFlight).toBe(0);
+    } finally {
+      map.delete = originalDelete as typeof map.delete;
+    }
+  }, 12000);
+
+  it('maintains O(1) local size and exact expiry across Redis replication and hydration', async () => {
+    const first = openMap('redis-size-expiry');
+    const second = openMap('redis-size-expiry');
+    await Promise.all([first.ready(), second.ready()]);
+    for (let i = 0; i < 50; i++) {
+      await first.set('ttl-' + i, i, { ttlMs: 450 });
+    }
+    await eventually(() => second.size === 50);
+    const internal = second as unknown as {
+      currentValue: (value: unknown) => unknown;
+      entriesByKey: Map<string, unknown>;
+      versionsByKey: Map<string, number>;
+    };
+    const originalCurrentValue = internal.currentValue.bind(second);
+    let scans = 0;
+    internal.currentValue = (entry: unknown) => {
+      scans++;
+      return originalCurrentValue(entry);
+    };
+    try {
+      for (let i = 0; i < 500; i++) expect(second.size).toBe(50);
+      expect(scans).toBe(0);
+      await second.resync();
+      expect(second.size).toBe(50);
+      await sleep(520);
+      expect(second.size).toBe(0);
+      expect(internal.entriesByKey.size).toBe(0);
+      expect(scans).toBe(0);
+    } finally {
+      internal.currentValue = originalCurrentValue;
+    }
+  }, 12000);
+
+  it('skips unchanged periodic scans with noeviction, without skipping explicit resync', async () => {
+    const redis = new Redis(url);
+    const map = new SyncedMap<string, number>({
+      namespace: 'idle-reconcile-probe',
+      redis: { client: redis },
+      resyncIntervalMs: 0,
+    });
+    await map.ready();
+    const originalScan = redis.scan.bind(redis);
+    let scans = 0;
+    redis.scan = ((...args: Parameters<typeof redis.scan>) => {
+      scans++;
+      return originalScan(...args);
+    }) as typeof redis.scan;
+    try {
+      const internal = map as unknown as {
+        runResync: (periodic: boolean) => Promise<void>;
+      };
+      await internal.runResync(true);
+      expect(scans).toBe(0);
+      await map.set('changed', 1);
+      await internal.runResync(true);
+      expect(scans).toBeGreaterThan(0);
+      scans = 0;
+      await internal.runResync(true);
+      expect(scans).toBe(0);
+      await map.resync();
+      expect(scans).toBeGreaterThan(0);
+    } finally {
+      redis.scan = originalScan as typeof redis.scan;
+      await map.dispose();
+      redis.disconnect();
+    }
+  }, 12000);
+
+  it('hydrates multiple Redis cursor pages with concurrent MGET batches', async () => {
+    const namespace = 'large-snapshot-parallel';
+    const writer = openMap(namespace);
+    await writer.ready();
+    for (let start = 0; start < 1300; start += 32) {
+      await Promise.all(
+        Array.from({ length: Math.min(32, 1300 - start) }, (_, offset) =>
+          writer.set('key-' + (start + offset), start + offset)
+        )
+      );
+    }
+
+    const client = new Redis(url);
+    const originalMget = client.mget.bind(client);
+    const originalScan = client.scan.bind(client);
+    let activeMgets = 0;
+    let maximumMgets = 0;
+    let scanCalls = 0;
+    client.scan = ((...args: Parameters<typeof client.scan>) => {
+      scanCalls++;
+      return originalScan(...args);
+    }) as typeof client.scan;
+    client.mget = (async (...keys: string[]) => {
+      activeMgets++;
+      maximumMgets = Math.max(maximumMgets, activeMgets);
+      try {
+        await sleep(4);
+        return await originalMget(...keys);
+      } finally {
+        activeMgets--;
+      }
+    }) as typeof client.mget;
+    const replica = new SyncedMap<string, number>({
+      namespace, redis: { client }, resyncIntervalMs: 0,
+    });
+    try {
+      await replica.ready();
+      expect(scanCalls).toBeGreaterThan(1);
+      expect(maximumMgets).toBeGreaterThan(1);
+      expect(activeMgets).toBe(0);
+      expect(replica.size).toBe(1300);
+      for (const i of [0, 19, 200, 999, 1299]) {
+        expect(replica.get('key-' + i)).toBe(i);
+      }
+    } finally {
+      await replica.dispose();
+      client.mget = originalMget as typeof client.mget;
+      client.scan = originalScan as typeof client.scan;
+      client.disconnect();
+    }
+  }, 20000);
+
+  it('periodic revision check repairs writes missed by the subscriber', async () => {
+    const namespace = 'missed-event-periodic-repair';
+    const writer = openMap(namespace);
+    const replica = openMap(namespace);
+    await Promise.all([writer.ready(), replica.ready()]);
+    const subscriber = (replica as unknown as { subscriber: Redis }).subscriber;
+    await subscriber.unsubscribe('syncedmap:{missed-event-periodic-repair}:db:0:events');
+    await writer.set('missed', 42);
+    expect(replica.get('missed')).toBeUndefined();
+
+    const runPeriodic = (replica as unknown as {
+      runResync: (periodic: boolean) => Promise<void>;
+    }).runResync.bind(replica);
+    await runPeriodic(true);
+    expect(replica.get('missed')).toBe(42);
+    // Full hydration restores the Pub/Sub subscription. Drop it again to
+    // simulate a second missed event before the next periodic probe.
+    await subscriber.unsubscribe('syncedmap:{missed-event-periodic-repair}:db:0:events');
+    await writer.delete('missed');
+    expect(replica.get('missed')).toBe(42);
+    await runPeriodic(true);
+    expect(replica.get('missed')).toBeUndefined();
+  }, 12000);
+
+  it('does not skip periodic full scans under volatile Redis eviction', async () => {
+    const client = new Redis(url);
+    try {
+      await client.config('SET', 'maxmemory', '67108864');
+      await client.config('SET', 'maxmemory-policy', 'volatile-lru');
+      const map = new SyncedMap<string, number>({
+        namespace: 'volatile-reconcile-probe',
+        redis: { client },
+        resyncIntervalMs: 0,
+      });
+      await map.ready();
+      const originalScan = client.scan.bind(client);
+      let scans = 0;
+      client.scan = ((...args: Parameters<typeof client.scan>) => {
+        scans++;
+        return originalScan(...args);
+      }) as typeof client.scan;
+      try {
+        const internal = map as unknown as {
+          runResync: (periodic: boolean) => Promise<void>;
+        };
+        await internal.runResync(true);
+        expect(scans).toBeGreaterThan(0);
+      } finally {
+        client.scan = originalScan as typeof client.scan;
+        await map.dispose();
+      }
+    } finally {
+      await client.config('SET', 'maxmemory-policy', 'noeviction');
+      await client.config('SET', 'maxmemory', '0');
+      client.disconnect();
+    }
+  }, 12000);
+
   it('synchronizes real separate Node processes, not just instances in one process', async () => {
     const namespace = 'processes';
     const main = openMap(namespace);

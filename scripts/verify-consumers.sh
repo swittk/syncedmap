@@ -10,8 +10,8 @@ cleanup() {
 trap cleanup EXIT
 cd "$repo"
 npm run build >/dev/null
-npm pack --silent --ignore-scripts --pack-destination "$work" >/dev/null
-tarball="$work/syncedmap-0.1.0.tgz"
+tarball_name="$(npm pack --json=false --silent --ignore-scripts --pack-destination "$work" | tail -n 1)"
+tarball="$work/$tarball_name"
 test -f "$tarball"
 mkdir -p "$work/consumer"
 cd "$work/consumer"
