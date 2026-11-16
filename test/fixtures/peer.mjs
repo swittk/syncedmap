@@ -1,7 +1,16 @@
 import readline from 'node:readline';
 import { SyncedMap } from '../../dist/index.js';
 
-const map = new SyncedMap({ namespace: process.argv[3], redis: { url: process.argv[2] } });
+let clusterClient;
+let redisConfig = { url: process.argv[2] };
+if (process.argv[2].startsWith('cluster://')) {
+  const parsed = new URL(process.argv[2]);
+  const { Cluster } = await import('ioredis');
+  clusterClient = new Cluster([{ host: parsed.hostname, port: Number(parsed.port) }]);
+  clusterClient.on('error', () => undefined);
+  redisConfig = { client: clusterClient };
+}
+const map = new SyncedMap({ namespace: process.argv[3], redis: redisConfig });
 await map.ready();
 process.stdout.write(JSON.stringify({ ready: true }) + '\n');
 
@@ -22,6 +31,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
       result = await map.getFresh(message.key);
     } else if (message.op === 'shutdown') {
       await map.dispose();
+      clusterClient?.disconnect();
       process.stdout.write(JSON.stringify({ id: message.id, result: true }) + '\n');
       process.exit(0);
     } else {
@@ -33,3 +43,4 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
   }
 }
 await map.dispose();
+clusterClient?.disconnect();

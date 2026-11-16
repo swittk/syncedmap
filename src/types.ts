@@ -23,9 +23,30 @@ export interface SyncedMapRedisClient extends RedisClientLike {
   options?: { keyPrefix?: string; db?: number };
 }
 
+/** Redis Cluster routing is supplied by the caller's ioredis Cluster client.
+ * All Redis keys for a SyncedMap namespace already share one hash slot.
+ * The Cluster client owns its Redis sockets; SyncedMap closes only its
+ * own duplicated subscriber.
+ */
+export interface SyncedMapRedisClusterClient extends Omit<SyncedMapRedisClient, 'duplicate' | 'options'> {
+  readonly isCluster: boolean;
+  ping(): Promise<string>;
+  cluster(command: 'SLOTS'): Promise<unknown>;
+  /** Updates ioredis routing and node connections before a Cluster-wide SCAN. */
+  refreshSlotsCache(callback?: (error?: Error | null) => void): void;
+  nodes(role: 'master' | 'all'): SyncedMapRedisClient[];
+  duplicate(
+    startupNodes?: Array<string | number | { host?: string; port?: number }>,
+    options?: { lazyConnect?: boolean }
+  ): SyncedMapRedisClusterClient;
+  options: { keyPrefix?: string; redisOptions?: { keyPrefix?: string; db?: number }; scaleReads?: unknown };
+}
+
+export type SyncedMapRedisConnection = SyncedMapRedisClient | SyncedMapRedisClusterClient;
+
 export type SyncedMapRedisConfig =
   | { url: string; client?: never }
-  | { client: SyncedMapRedisClient; url?: never };
+  | { client: SyncedMapRedisConnection; url?: never };
 
 export interface SyncedMapOptions {
   /** Shared namespace. All participants in a logical map must use exactly the same namespace. */

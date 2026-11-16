@@ -44,6 +44,67 @@ The client's configured options.db selects the database; Pub/Sub is scoped by
 that database so equal namespaces in different Redis databases stay isolated.
 Changing a supplied client's selected database after construction is unsupported.
 
+### Redis Cluster
+
+A real **ioredis Cluster** client is also supported. Provide a caller-owned
+client; a single Redis URL creates a standalone Redis connection, not a
+Cluster-aware connection.
+
+    import { Cluster } from 'ioredis';
+    import { SyncedMap } from 'syncedmap';
+
+    const cluster = new Cluster([
+      { host: 'redis-a.internal', port: 6379 },
+      { host: 'redis-b.internal', port: 6379 },
+      { host: 'redis-c.internal', port: 6379 },
+    ]);
+    const shared = new SyncedMap<string, { online: boolean }>({
+      namespace: 'presence',
+      redis: { client: cluster },
+    });
+    await shared.ready();
+    await shared.set('user-1', { online: true });
+    const local = shared.get('user-1'); // synchronous local replica
+    await shared.dispose();
+    cluster.disconnect(); // caller owns the Cluster client
+
+Each namespace uses a Redis hash tag, so its records and revision counter
+reside in one slot and its multi-key Lua writes remain atomic. Different
+namespaces can land on different Cluster primaries. Full reconciliation and
+clear scan **every Cluster primary** because Redis SCAN is node-local; MGET,
+reads, and writes are routed through the Cluster client. Before scanning,
+SyncedMap explicitly refreshes ioredis's cached primary inventory (including
+when its automatic slot refresh is disabled). Periodic reconciliation
+also checks slot topology: a reshard or failover forces a full scan even if
+the revision counter appears unchanged. If topology changes *during* a full
+scan, SyncedMap retries instead of installing a potentially incomplete
+snapshot and rejects persistently unstable scans. Active MIGRATING/IMPORTING
+slots also block full scans and `clear()` until the migration completes;
+otherwise Redis could omit keys even when CLUSTER SLOTS looks unchanged.
+`clear()` retries key collection on topology changes before deleting any keys.
+
+Reconnection of the internal Cluster Pub/Sub socket triggers a full repair,
+including automatic same-socket reconnection in older ioredis 5.x, even with
+`resyncIntervalMs: 0`. If the socket keeps retrying a permanently unreachable
+endpoint, SyncedMap refreshes the Cluster's node inventory and moves its owned
+subscriber to another node before rehydrating.
+
+Redis Cluster uses only database 0. Configure the Cluster client with
+\`scaleReads: 'master'\` (or leave it at the default); replica-read routing
+would make hydration potentially stale. The client must not use keyPrefix.
+Configure consistent noeviction or acceptable volatile-* memory policies on
+**all masters and replicas that may be promoted**. The startup guard checks
+all nodes currently advertised to ioredis, but a replica not yet advertised
+may not be checked. Do not rely on dynamically inconsistent memory policies.
+
+Replication events use normal Redis Pub/Sub, which is broadcast throughout
+the cluster; sharded Pub/Sub is not used. Redis Cluster failover is
+asynchronously replicated: a sudden primary failure can lose recently
+acknowledged writes or lock state. This does not provide durability, strong
+fencing across failover, or protection for financial/clinical invariants.
+Use Redis Cluster for ephemeral shared state, with authoritative durable data
+stored elsewhere.
+
 **Use a separate namespace and security/deployment boundary per tenant.**
 Namespaces are not an authorization mechanism.
 
@@ -172,9 +233,11 @@ user authorization, and durable event processing are deliberately out of scope.
     npm install
     npm run check
 
-The suite covers local concurrency and **real Redis**, including separate Node
-processes. It starts and stops an ephemeral redis-server; ensure redis-server
-is on PATH. Builds provide ESM, CommonJS, and TypeScript declarations.
+The suite covers local concurrency, **real standalone Redis**, and a real
+six-node Redis Cluster (three primaries, three replicas), including separate
+Node processes and both planned and abrupt primary failover. It starts and
+stops temporary redis-server processes; ensure redis-server **and redis-cli**
+are on PATH. Builds provide ESM, CommonJS, and TypeScript declarations.
 
 The package is published on npm. Redis integration is optional; no
 application-specific setup or deployment is bundled with the library.

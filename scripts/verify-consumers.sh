@@ -78,6 +78,20 @@ done
 echo "== Redis-enabled external package installation =="
 npm install --silent --no-audit --no-fund --ignore-scripts --no-save ioredis@5.11.1 redlock@5.0.0-beta.2 >/dev/null
 node -e "require.resolve('ioredis');require.resolve('redlock')"
+# Compile a real ioredis Cluster consumer against the packed public declarations.
+cat > cluster-demo.mts <<'TS'
+import { Cluster } from 'ioredis';
+import { SyncedMap, type SyncedMapRedisClusterClient } from 'syncedmap';
+const client = new Cluster([{ host: '127.0.0.1', port: 7000 }], { lazyConnect: true });
+const compatible: SyncedMapRedisClusterClient = client;
+const map = new SyncedMap<string, number>({ namespace: 'cluster:typing', redis: { client } });
+void compatible;
+void map;
+client.disconnect();
+TS
+cp cluster-demo.mts cluster-demo.cts
+./node_modules/.bin/tsc --noEmit --strict --skipLibCheck false   --module NodeNext --moduleResolution NodeNext --target ES2015 --types node   cluster-demo.mts cluster-demo.cts
+echo "Strict TypeScript Cluster client ESM+CJS PASS"
 port="$(node -e "const net=require('node:net');const s=net.createServer();s.listen(0,'127.0.0.1',()=>{const p=s.address().port;s.close(()=>console.log(p))})")"
 redis-server --bind 127.0.0.1 --port "$port" --save '' --appendonly no >"$work/redis.log" 2>&1 &
 redis_pid="$!"
