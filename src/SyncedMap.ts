@@ -665,7 +665,14 @@ export class SyncedMap<Key extends string, Value> implements Iterable<[Key, Valu
     if (nodeStates.some(state => /\[\d+-(?:>|<)-[0-9a-f]+\]/i.test(state))) {
       throw new Error('Redis Cluster slot migration is in progress; cannot safely scan namespace.');
     }
-    return JSON.stringify(slots);
+    // A primary can report the same slot owners with replica nodes in a
+    // different discovery order. Only range ownership affects SCAN coverage:
+    // ignore replica ordering, but retain the primary's address and node ID
+    // so promotions and resharding still invalidate a stale snapshot.
+    const ranges = slots as Array<[number, number, [string, number, string]]>;
+    return JSON.stringify(ranges.map(([start, end, primary]) =>
+      [start, end, primary[0], primary[1], primary[2]]
+    ).sort((a, b) => Number(a[0]) - Number(b[0])));
   }
 
   /** Build one full snapshot; never install it before checking Cluster topology. */

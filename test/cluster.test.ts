@@ -97,6 +97,15 @@ async function createCluster(): Promise<void> {
   );
 }
 
+/** Simulate changed slot ownership using Redis's actual CLUSTER SLOTS shape. */
+function changedPrimaryTopology(slots: unknown, ownerId: string): unknown {
+  const ranges = structuredClone(slots) as Array<
+    [number, number, [string, number, string], ...unknown[]]
+  >;
+  ranges[0]![2][2] = ownerId;
+  return ranges;
+}
+
 function newClient(): Cluster {
   const client = new Cluster(
     [{ host: '127.0.0.1', port: basePort }],
@@ -512,7 +521,9 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     let topologyCalls = 0;
     raw.cluster = async command => {
       const value = await originalTopology(command);
-      if (command === 'SLOTS' && ++topologyCalls === 2) return ['topology changed'];
+      if (command === 'SLOTS' && ++topologyCalls === 2) {
+        return changedPrimaryTopology(value, 'changed-clear-owner');
+      }
       return value;
     };
     const primaries = client.nodes('master');
@@ -548,8 +559,12 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     const raw = client as unknown as { cluster(command: string): Promise<unknown> };
     const original = raw.cluster.bind(client);
     let generation = 0;
-    raw.cluster = async command =>
-      command === 'SLOTS' ? { generation: ++generation } : original(command);
+    raw.cluster = async command => {
+      const value = await original(command);
+      return command === 'SLOTS'
+        ? changedPrimaryTopology(value, 'clear-owner-' + ++generation)
+        : value;
+    };
     try {
       await expect(map.clear()).rejects.toThrow(/topology changed repeatedly/);
       expect(await map.getFresh('keep')).toBe(83);
@@ -678,6 +693,42 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     }
   }, 18000);
 
+  it('ignores equivalent replica ordering in Cluster topology probes', async () => {
+    const client = newClient();
+    const map = openMap('cluster-equivalent-replica-order', client);
+    await map.ready();
+    await map.set('survive', 42);
+    const original = client.cluster.bind(client);
+    let reads = 0;
+    // CLUSTER SLOTS can list replicas in a different order on successive
+    // healthy primary nodes even when ownership hasn't changed.
+    const alternateReplicaOrder = (slots: unknown) => {
+      const ranges = structuredClone(slots) as Array<
+        [number, number, [string, number, string], ...Array<[string, number, string]>]
+      >;
+      return ranges.map(([from, to, primary], i) => {
+        const replicas: Array<[string, number, string]> = [
+          [primary[0], primary[1] + 100, 'replica-a-' + i],
+          [primary[0], primary[1] + 101, 'replica-b-' + i],
+        ];
+        if ((++reads & 1) === 0) replicas.reverse();
+        return [from, to, primary, ...replicas];
+      });
+    };
+    client.cluster = ((command: string, ...args: unknown[]) =>
+      original(command as 'SLOTS', ...args as []) .then(slots =>
+        command === 'SLOTS' ? alternateReplicaOrder(slots) : slots
+      )) as typeof client.cluster;
+    try {
+      await map.resync();
+      expect(map.get('survive')).toBe(42);
+      await map.clear();
+      expect(await map.getFresh('survive')).toBeUndefined();
+    } finally {
+      client.cluster = original as typeof client.cluster;
+    }
+  }, 15000);
+
   it('retries a scan that missed keys during a Cluster topology transition', async () => {
     const client = newClient();
     const writer = openMap('cluster-topology-retry', client);
@@ -694,7 +745,9 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     let topologyCalls = 0;
     raw.cluster = async command => {
       const value = await originalTopology(command);
-      if (command === 'SLOTS' && ++topologyCalls === 2) return ['changed during scan'];
+      if (command === 'SLOTS' && ++topologyCalls === 2) {
+        return changedPrimaryTopology(value, 'changed-scan-owner');
+      }
       return value;
     };
     const primaries = readerClient.nodes('master');
@@ -735,8 +788,12 @@ describe('real six-node Redis Cluster (three masters and three replicas)', () =>
     const raw = client as unknown as { cluster(command: string): Promise<unknown> };
     const original = raw.cluster.bind(client);
     let generation = 0;
-    raw.cluster = async command =>
-      command === 'SLOTS' ? { generation: ++generation } : original(command);
+    raw.cluster = async command => {
+      const value = await original(command);
+      return command === 'SLOTS'
+        ? changedPrimaryTopology(value, 'scan-owner-' + ++generation)
+        : value;
+    };
 
     const notifications: string[] = [];
     const stop = reader.subscribe(change => notifications.push(change.type));
